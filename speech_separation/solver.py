@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from losses.loss import loss_mossformer2_ss
+#datnd
+from torch.cuda.amp import GradScaler, autocast
 
 class Solver(object):
     def __init__(self, args, model, optimizer, train_data, validation_data, test_data):
@@ -21,6 +23,20 @@ class Solver(object):
 
         self.model = model
         self.optimizer=optimizer
+
+        #datnd
+         # Initialize AMP (Automatic Mixed Precision) - luôn luôn bật
+        if torch.cuda.is_available():
+            self.scaler = GradScaler()
+            self.amp_dtype = torch.float16
+            if self.print:
+                print(f"AMP enabled with dtype: {self.amp_dtype}")
+        else:
+            self.scaler = None
+            self.amp_dtype = None
+            if self.print:
+                print("AMP disabled (CUDA not available)")
+                
         if self.args.distributed:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
             self.model = DDP(self.model, device_ids=[self.args.local_rank],find_unused_parameters=True)
@@ -293,15 +309,16 @@ class Solver(object):
             # Save the latest checkpoint (+ cập nhật last_checkpoint)
             
 
-            # Nếu là best: chỉ cần cập nhật con trỏ last_best_checkpoint (không ghi file lại)
-            if find_best_model:
-                if self.print: print("Found new best model")
-                self._write_pointer('last_best_checkpoint')
+            
 
             # Sau mỗi epoch: dọn rác, giữ lại 3 checkpoint gần nhất (không xóa bản best)
             # self._purge_old_checkpoints(keep_last=3)
 
             self.epoch = self.epoch + 1
+            # Nếu là best: chỉ cần cập nhật con trỏ last_best_checkpoint (không ghi file lại)
+            if find_best_model:
+                if self.print: print("Found new best model")
+                self._write_pointer('last_best_checkpoint')
             #Thinhnt 01/09
             self.save_checkpoint()
             
@@ -321,38 +338,102 @@ class Solver(object):
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
 
-            Out_List = self.model(inputs)
-            loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+            #datnd
+             # Use AMP for forward pass
+            if self.scaler is not None:
+                with autocast(dtype=self.amp_dtype):
+                    Out_List = self.model(inputs)
+                    loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+            else:
+                Out_List = self.model(inputs)
+                loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
 
+            # Out_List = self.model(inputs)
+            # loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+
+            # if state=='train':
+            #     if self.args.accu_grad:
+            #         self.accu_count += 1
+            #         loss_bw = loss[loss > self.args.loss_threshold]
+            #         if loss_bw.nelement() > 0:
+            #             loss_bw = loss_bw.mean()
+            #             if loss_bw < 999999:
+            #                 loss_scaled = loss_bw/(self.args.effec_batch_size / self.args.batch_size)
+            #                 loss_scaled.backward()
+            #                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+          
+            #         if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
+            #             self.optimizer.step()
+            #             self.optimizer.zero_grad()
+            #             self.accu_count = 0
+                # else:
+                #     loss_bw = loss[loss > self.args.loss_threshold]
+                #     if loss_bw.nelement() > 0:
+                #         loss_bw = loss_bw.mean()
+                #         if loss_bw < 999999:
+                #             loss_bw.backward()
+                #             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                #             self.optimizer.step()
+                #             self.optimizer.zero_grad()
             if state=='train':
+                did_backward = False   # flag
+                
                 if self.args.accu_grad:
                     self.accu_count += 1
                     loss_bw = loss[loss > self.args.loss_threshold]
-                    if loss_bw.nelement() > 0:
-                        loss_bw = loss_bw.mean()
-                        if loss_bw < 999999:
-                            loss_scaled = loss_bw/(self.args.effec_batch_size / self.args.batch_size)
-                            loss_scaled.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-          
-                    if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
-                        self.optimizer.step()
-                        self.optimizer.zero_grad()
-                        self.accu_count = 0
+                    if self.args.accu_grad:
+                        self.accu_count += 1
+                        loss_bw = loss[loss > self.args.loss_threshold]
+                        if loss_bw.nelement() > 0:
+                            loss_bw = loss_bw.mean()
+                            if loss_bw < 999999:
+                                loss_scaled = loss_bw / (self.args.effec_batch_size / self.args.batch_size)
 
+                                if self.scaler is not None:
+                                    self.scaler.scale(loss_scaled).backward()
+                                else:
+                                    loss_scaled.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                                did_backward = True
+
+                        # chỉ step khi accumulate đủ và đã backward
+                        if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
+                            if did_backward:
+                                if self.scaler is not None:
+                                    self.scaler.step(self.optimizer)
+                                    self.scaler.update()
+                                else:
+                                    self.optimizer.step()
+                            self.optimizer.zero_grad()
+                            self.accu_count = 0
+                
                 else:
                     loss_bw = loss[loss > self.args.loss_threshold]
                     if loss_bw.nelement() > 0:
                         loss_bw = loss_bw.mean()
                         if loss_bw < 999999:
-                            loss_bw.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                            self.optimizer.step()
+                            # Use AMP for backward pass
+                            if self.scaler is not None:
+                                self.scaler.scale(loss_bw).backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                loss_bw.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                                self.optimizer.step()
+                            
                             self.optimizer.zero_grad()
+                            did_backward = True
+
+                # logging + loss tracking
+                if 'loss_bw' in locals() and loss_bw.nelement() > 0:
+                    total_loss += loss_bw.detach()
+                    mix_loss_print += loss_bw.detach().cpu()
 
                 self.step += 1
                 ##cal losses for printing
-                mix_loss_print += loss_bw.data.cpu()
+                # mix_loss_print += loss_bw.data.cpu()
                 if (i + 1) % self.args.print_freq == 0:
                     eplashed = time.time() - stime
                     speed_avg = eplashed / (i+1)

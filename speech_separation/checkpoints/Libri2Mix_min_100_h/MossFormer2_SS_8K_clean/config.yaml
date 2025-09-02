@@ -18,8 +18,8 @@ load_type: 'one_input_multi_outputs'
 
 tr_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/train-100_Libri2Mix_clean_8k_min_100.scp'
 cv_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/val_Libri2Mix_clean_8k_min_100.scp'
-# init_learning_rate: 0.00015 #learning rate for a new training
-# finetune_learning_rate: 0.00005 #learning rate for a finetune training
+init_learning_rate: 0.00015 #learning rate for a new training
+finetune_learning_rate: 0.00005 #learning rate for a finetune training
 
 loss_threshold: -9999.0 #to prevent very low loss
 max_epoch: 200
@@ -32,14 +32,8 @@ seed: 777
 
 # # dataset
 num_workers: 4
-# batch_size: 4
+batch_size: 4
 accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
-# effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
+effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
 max_length: 2         # truncate the utterances in dataloader, in seconds 
-
-batch_size: 6
-effec_batch_size: 6
-
-init_learning_rate: 0.0009
-finetune_learning_rate: 0.0003
 
