@@ -1,0 +1,23 @@
+
+
+  $python_path scripts/create_librimix_from_metadata.py --librispeech_dir $librispeech_dir \
+    --wham_dir $wham_dir \
+    --metadata_dir $metadata_dir \
+    --librimix_outdir $librimix_outdir \
+    --n_src $n_src \
+    --freqs 8k 16k \
+    --modes min max \
+    --types mix_clean mix_both mix_single
+
+copy cái này chạy, muốn này chỉ 8k và lấy folder min
+python scripts/create_librimix_from_metadata.py --librispeech_dir /home/IT2021-XLTHSNC/speech_separation/dataset/LibriSpeech \
+    --wham_dir /home/IT2021-XLTHSNC/speech_separation/dataset/wham_noise \
+    --metadata_dir metadata/Libri2Mix \
+    --librimix_outdir /home/IT2021-XLTHSNC/speech_separation/dataset/ \
+    --n_src 2 \
+    --freqs 8k \
+    --modes min \
+    --types mix_clean mix_both mix_single
+
+chạy sh
+./train_new.sh clean MossFormer2_SS_8K Libri2Mix_min

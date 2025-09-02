@@ -168,45 +168,6 @@ class Solver(object):
             f.write('model.ckpt-{}-{}.pt'.format(self.epoch, self.step))
         print("=> Save checkpoint:", checkpoint_path)
 
-    def _write_pointer(self, name):
-        """Ghi file con trỏ (vd: 'last_checkpoint', 'last_best_checkpoint')."""
-        ptr_path = os.path.join(self.args.checkpoint_dir, name)
-        with open(ptr_path, 'w') as f:
-            f.write(f"model.ckpt-{self.epoch}-{self.step}.pt")
-    
-    def _purge_old_checkpoints(self, keep_last=3):
-        """Giữ 3 checkpoint gần nhất, nhưng KHÔNG xóa checkpoint đang được trỏ bởi 'last_best_checkpoint'."""
-        dirp = self.args.checkpoint_dir
-        # đọc tên file best để không xóa nhầm
-        best_ptr = os.path.join(dirp, 'last_best_checkpoint')
-        best_name = None
-        if os.path.isfile(best_ptr):
-            with open(best_ptr, 'r') as f:
-                best_name = f.readline().strip()
-
-        # liệt kê & sắp xếp theo (epoch, step)
-        ckpts = []
-        for p in glob.glob(os.path.join(dirp, "model.ckpt-*-*.pt")):
-            m = re.search(r"model\.ckpt-(\d+)-(\d+)\.pt$", os.path.basename(p))
-            if m:
-                ep, st = int(m.group(1)), int(m.group(2))
-                ckpts.append((ep, st, p))
-        ckpts.sort(key=lambda x: (x[0], x[1]))  # cũ -> mới
-
-        # tính tập cần giữ: 3 cái mới nhất + (nếu có) file best
-        to_keep = set(p for _,_,p in ckpts[-keep_last:])
-        if best_name:
-            to_keep.add(os.path.join(dirp, best_name))
-
-        # xóa phần còn lại
-        for _,_,p in ckpts:
-            if p not in to_keep:
-                try:
-                    os.remove(p)
-                    if self.print: print(f"Removed old checkpoint: {p}")
-                except FileNotFoundError:
-                    pass
-
     def train(self):
         start_epoch = self.epoch
         for epoch in range(start_epoch, self.args.max_epoch+1):
@@ -282,30 +243,12 @@ class Solver(object):
                 if self.args.tt_list is not None:
                     self.writer.add_scalar('Test_loss', test_loss, epoch)
 
-            # # Save model
-            # self.save_checkpoint()
-            # if find_best_model:
-            #     print("Found new best model, dict saved")
-            #     self.save_checkpoint(mode='last_best_checkpoint')
-            # self.epoch = self.epoch + 1
-
-            # Thinhnht
-            # Save the latest checkpoint (+ cập nhật last_checkpoint)
-            
-
-            # Nếu là best: chỉ cần cập nhật con trỏ last_best_checkpoint (không ghi file lại)
-            if find_best_model:
-                if self.print: print("Found new best model")
-                self._write_pointer('last_best_checkpoint')
-
-            # Sau mỗi epoch: dọn rác, giữ lại 3 checkpoint gần nhất (không xóa bản best)
-            # self._purge_old_checkpoints(keep_last=3)
-
-            self.epoch = self.epoch + 1
-            #Thinhnt 01/09
+            # Save model
             self.save_checkpoint()
-            
-            # Thinhnht
+            if find_best_model:
+                self.save_checkpoint(mode='last_best_checkpoint')
+                print("Found new best model, dict saved")
+            self.epoch = self.epoch + 1
 
     def _run_one_epoch_mossformer2_ss(self, data_loader, state='train'):
         num_batch = len(data_loader)
@@ -358,19 +301,19 @@ class Solver(object):
                     speed_avg = eplashed / (i+1)
                     mix_loss_print_avg = mix_loss_print / self.args.print_freq
                     #datnd
-                    # if self.print: print('{} Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
-                    #   ' Total_Loss {:2.4f}'
-                    #   .format(state.capitalize(), self.epoch, self.args.max_epoch,
-                    #       i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
-                    #       mix_loss_print_avg,
-                    #     ))
-                    
-                    if self.print: print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
+                    if self.print: print('{} Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
                       ' Total_Loss {:2.4f}'
-                      .format(self.epoch, self.args.max_epoch,
+                      .format(state.capitalize(), self.epoch, self.args.max_epoch,
                           i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
                           mix_loss_print_avg,
                         ))
+                    
+                    # if self.print: print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
+                    #   ' Total_Loss {:2.4f}'
+                    #   .format(self.epoch, self.args.max_epoch,
+                    #       i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
+                    #       mix_loss_print_avg,
+                    #     ))
                     mix_loss_print = 0.0
                 if (i + 1) % self.args.checkpoint_save_freq == 0:
                     self.save_checkpoint()

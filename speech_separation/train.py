@@ -31,7 +31,7 @@ def main(args):
         print(args)
         #print(model)
         #print("\nTotal number of model parameters: {} \n".format(sum(p.numel() for p in model.parameters())))
-        print("\nTotal number of model parameters: {} \n".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
+        print("\nTổng số parameters của mô hình là: {} \n".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
         
     
     if args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K']:
