@@ -74,6 +74,8 @@ b. Create your own dataset
 bash train.sh
 ```
 
+**Note**: This project automatically uses AMP (Automatic Mixed Precision) for faster training and reduced memory usage. AMP is enabled by default when CUDA is available.
+
 You may need to set the correct network in `train.sh` and choose either a fresh training or a finetune process using:
 ```
 network=MossFormer2_SS_16K              #Train MossFormer2_SS_16K model

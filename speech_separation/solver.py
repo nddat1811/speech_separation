@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from losses.loss import loss_mossformer2_ss
+from torch.cuda.amp import GradScaler, autocast
 
 class Solver(object):
     def __init__(self, args, model, optimizer, train_data, validation_data, test_data):
@@ -21,6 +22,19 @@ class Solver(object):
 
         self.model = model
         self.optimizer=optimizer
+        
+        # Initialize AMP (Automatic Mixed Precision) - luôn luôn bật
+        if torch.cuda.is_available():
+            self.scaler = GradScaler()
+            self.amp_dtype = torch.float16
+            if self.print:
+                print(f"AMP enabled with dtype: {self.amp_dtype}")
+        else:
+            self.scaler = None
+            self.amp_dtype = None
+            if self.print:
+                print("AMP disabled (CUDA not available)")
+        
         if self.args.distributed:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
             self.model = DDP(self.model, device_ids=[self.args.local_rank],find_unused_parameters=True)
@@ -321,8 +335,14 @@ class Solver(object):
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
 
-            Out_List = self.model(inputs)
-            loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+            # Use AMP for forward pass
+            if self.scaler is not None:
+                with autocast(dtype=self.amp_dtype):
+                    Out_List = self.model(inputs)
+                    loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+            else:
+                Out_List = self.model(inputs)
+                loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
 
             if state=='train':
                 if self.args.accu_grad:
@@ -332,11 +352,21 @@ class Solver(object):
                         loss_bw = loss_bw.mean()
                         if loss_bw < 999999:
                             loss_scaled = loss_bw/(self.args.effec_batch_size / self.args.batch_size)
-                            loss_scaled.backward()
+                            
+                            # Use AMP for backward pass
+                            if self.scaler is not None:
+                                self.scaler.scale(loss_scaled).backward()
+                            else:
+                                loss_scaled.backward()
+                                
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
           
                     if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
-                        self.optimizer.step()
+                        if self.scaler is not None:
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                        else:
+                            self.optimizer.step()
                         self.optimizer.zero_grad()
                         self.accu_count = 0
 
@@ -345,9 +375,16 @@ class Solver(object):
                     if loss_bw.nelement() > 0:
                         loss_bw = loss_bw.mean()
                         if loss_bw < 999999:
-                            loss_bw.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                            self.optimizer.step()
+                            # Use AMP for backward pass
+                            if self.scaler is not None:
+                                self.scaler.scale(loss_bw).backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                            else:
+                                loss_bw.backward()
+                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                                self.optimizer.step()
                             self.optimizer.zero_grad()
 
                 self.step += 1
