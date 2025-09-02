@@ -11,6 +11,7 @@ import yamlargparse
 import soundfile as sf
 import warnings
 from networks import network_wrapper
+from torch.cuda.amp import autocast
 
 warnings.filterwarnings("ignore")
 
@@ -32,10 +33,26 @@ def inference(args):
             os.makedirs(output_wave_dir)
         num_samples = len(data_reader)
         print('Decoding...')
+        
+        # Setup AMP for inference - luôn luôn bật
+        if torch.cuda.is_available():
+            amp_dtype = torch.float16
+            print(f"AMP enabled for inference with dtype: {amp_dtype}")
+        else:
+            amp_dtype = None
+            print("AMP disabled for inference (CUDA not available)")
+            
         for idx in range(num_samples):
             input_audio, wav_id, input_len = data_reader[idx]
             print(f'audio: {wav_id}')
-            output_audios = decode_one_audio(model, device, input_audio, args) 
+            
+            # Use AMP for inference if available
+            if amp_dtype is not None:
+                with autocast(dtype=amp_dtype):
+                    output_audios = decode_one_audio(model, device, input_audio, args)
+            else:
+                output_audios = decode_one_audio(model, device, input_audio, args)
+                
             for spk in range(args.num_spks):
                 output_audio = output_audios[spk][:input_len]
                 sf.write(os.path.join(output_wave_dir, wav_id.replace('.wav', '_s'+str(spk+1)+'.wav')), output_audio, args.sampling_rate)
