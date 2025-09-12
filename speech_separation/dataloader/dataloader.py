@@ -243,9 +243,10 @@ class DistributedSampler(data.Sampler):
     def __iter__(self):
         if self.shuffle:
             # deterministically shuffle based on epoch and seed
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            ind = torch.randperm(int(len(self.dataset)/self.num_replicas), generator=g)*self.num_replicas
+            if not hasattr(self, 'generator'):
+                self.generator = torch.Generator()
+            self.generator.manual_seed(self.seed + self.epoch)
+            ind = torch.randperm(int(len(self.dataset)/self.num_replicas), generator=self.generator)*self.num_replicas
             indices = []
             for i in range(self.num_replicas):
                 indices = indices + (ind+i).tolist()

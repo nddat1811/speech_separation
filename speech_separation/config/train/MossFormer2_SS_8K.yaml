@@ -24,6 +24,7 @@ max_epoch: 120
 
 weight_decay: 0.00001
 clip_grad_norm: 10.
+optimizer_type: 'adamw'  # 'adam' or 'adamw' (recommended: adamw)
 
 # Log 
 seed: 777

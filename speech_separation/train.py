@@ -8,13 +8,22 @@ from solver import Solver
 import sys
 sys.path.append('../../')
 
-def main(args):
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    os.environ['PYTORCH_SEED'] = str(args.seed)
+def set_random_seeds(seed):
+    """Thiết lập seed cho tất cả các random generator"""
+    random.seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTORCH_SEED'] = str(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.manual_seed(args.seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+def main(args):
+    # Chỉ thiết lập seed ban đầu, trạng thái sẽ được khôi phục từ checkpoint nếu có
+    set_random_seeds(args.seed)
+    
     device = torch.device('cuda') if args.use_cuda else torch.device('cpu')
     args.device = device
 
@@ -35,7 +44,23 @@ def main(args):
         
     
     if args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K']:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.init_learning_rate)
+        # Sử dụng AdamW thay vì Adam để có kết quả tốt hơn
+        # AdamW xử lý weight decay đúng cách hơn và thường cho kết quả tốt hơn
+        if args.optimizer_type == 'adam':
+            optimizer = torch.optim.Adam(model.parameters(), 
+                                       lr=args.init_learning_rate,
+                                       weight_decay=args.weight_decay)
+            if (args.distributed and args.local_rank ==0) or args.distributed == False:
+                print("Using Adam optimizer")
+        else:
+            # Mặc định sử dụng AdamW
+            optimizer = torch.optim.AdamW(model.parameters(), 
+                                        lr=args.init_learning_rate,
+                                        weight_decay=args.weight_decay,
+                                        betas=(0.9, 0.999),
+                                        eps=1e-8)
+            if (args.distributed and args.local_rank ==0) or args.distributed == False:
+                print("Using AdamW optimizer (recommended)")
     else:
         print(f'in Main, {args.network} is not implemented!')
         return
@@ -106,7 +131,9 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', dest='weight_decay', type=float, default=0.00001)
     parser.add_argument('--clip-grad-norm', dest='clip_grad_norm', type=float, default=10.)
     parser.add_argument(
-        '--loss-threshold', dest='loss_threshold', type=float, default=-9999.0, help='the mimum loss threshold') 
+        '--loss-threshold', dest='loss_threshold', type=float, default=-9999.0, help='the mimum loss threshold')
+    parser.add_argument('--optimizer_type', type=str, default='adamw', 
+                        choices=['adam', 'adamw'], help='Optimizer type: adam or adamw (default: adamw)') 
     # Distributed training
     parser.add_argument("--local-rank", dest='local_rank', type=int, default=0)
 

@@ -1,5 +1,6 @@
-import time, os
+import time, os, random
 import torch
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -95,6 +96,24 @@ class Solver(object):
 
             self.epoch = checkpoint['epoch']
             self.step = checkpoint['step']
+            
+            # Khôi phục trạng thái random generator
+            if 'random_state' in checkpoint:
+                random_state = checkpoint['random_state']
+                try:
+                    random.setstate(random_state['python_random_state'])
+                    np.random.set_state(random_state['numpy_random_state'])
+                    torch.set_rng_state(random_state['torch_random_state'])
+                    if random_state['cuda_random_state'] is not None and torch.cuda.is_available():
+                        torch.cuda.set_rng_state(random_state['cuda_random_state'])
+                    print('=> Random states restored successfully')
+                except Exception as e:
+                    print(f"Warning: Failed to restore random states: {e}")
+            
+            # Khôi phục trạng thái dataloader
+            if 'dataloader_state' in checkpoint:
+                self._restore_dataloader_state(checkpoint['dataloader_state'])
+            
             print('=> Reloaded previous model and optimizer. Continue training ...')
             return 2
 
@@ -145,6 +164,24 @@ class Solver(object):
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
                 self.epoch=checkpoint['epoch']
                 self.step = checkpoint['step']
+                
+                # Khôi phục trạng thái random generator
+                if 'random_state' in checkpoint:
+                    random_state = checkpoint['random_state']
+                    try:
+                        random.setstate(random_state['python_random_state'])
+                        np.random.set_state(random_state['numpy_random_state'])
+                        torch.set_rng_state(random_state['torch_random_state'])
+                        if random_state['cuda_random_state'] is not None and torch.cuda.is_available():
+                            torch.cuda.set_rng_state(random_state['cuda_random_state'])
+                        if self.print: print('=> Random states restored successfully')
+                    except Exception as e:
+                        if self.print: print(f"Warning: Failed to restore random states: {e}")
+                
+                # Khôi phục trạng thái dataloader
+                if 'dataloader_state' in checkpoint:
+                    self._restore_dataloader_state(checkpoint['dataloader_state'])
+                
                 if self.print: print("Resume training from epoch: {}".format(self.epoch))
 
             else:
@@ -159,14 +196,48 @@ class Solver(object):
     def save_checkpoint(self, mode='last_checkpoint'):
         checkpoint_path = os.path.join(
             self.args.checkpoint_dir, 'model.ckpt-{}-{}.pt'.format(self.epoch, self.step))
+        
+        # Lưu trạng thái random generator
+        random_state = {
+            'python_random_state': random.getstate(),
+            'numpy_random_state': np.random.get_state(),
+            'torch_random_state': torch.get_rng_state(),
+            'cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        }
+        
+        # Lưu trạng thái dataloader nếu có
+        dataloader_state = {}
+        if hasattr(self, 'train_data') and hasattr(self.train_data, 'sampler'):
+            if hasattr(self.train_data.sampler, 'epoch'):
+                dataloader_state['sampler_epoch'] = self.train_data.sampler.epoch
+            if hasattr(self.train_data.sampler, 'generator'):
+                dataloader_state['sampler_generator'] = self.train_data.sampler.generator.get_state() if hasattr(self.train_data.sampler.generator, 'get_state') else None
+        
         torch.save({'model': self.model.state_dict(),
                     'optimizer': self.optimizer.state_dict(),
                     'epoch': self.epoch,
-                    'step': self.step}, checkpoint_path)
+                    'step': self.step,
+                    'random_state': random_state,
+                    'dataloader_state': dataloader_state}, checkpoint_path)
 
         with open(os.path.join(self.args.checkpoint_dir, mode), 'w') as f:
             f.write('model.ckpt-{}-{}.pt'.format(self.epoch, self.step))
         print("=> Save checkpoint:", checkpoint_path)
+
+    def _restore_dataloader_state(self, dataloader_state):
+        """Khôi phục trạng thái của dataloader"""
+        try:
+            if hasattr(self, 'train_data') and hasattr(self.train_data, 'sampler'):
+                if 'sampler_epoch' in dataloader_state:
+                    self.train_data.sampler.epoch = dataloader_state['sampler_epoch']
+                    print(f'=> Dataloader epoch restored to: {dataloader_state["sampler_epoch"]}')
+                
+                if 'sampler_generator' in dataloader_state and dataloader_state['sampler_generator'] is not None:
+                    if hasattr(self.train_data.sampler, 'generator'):
+                        self.train_data.sampler.generator.set_state(dataloader_state['sampler_generator'])
+                        print('=> Dataloader generator state restored')
+        except Exception as e:
+            print(f"Warning: Failed to restore dataloader state: {e}")
 
     def train(self):
         start_epoch = self.epoch
