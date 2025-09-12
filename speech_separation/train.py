@@ -53,14 +53,17 @@ def main(args):
             if (args.distributed and args.local_rank ==0) or args.distributed == False:
                 print("Using Adam optimizer")
         else:
-            # Mặc định sử dụng AdamW
+            # Mặc định sử dụng AdamW với cấu hình tối ưu
             optimizer = torch.optim.AdamW(model.parameters(), 
                                         lr=args.init_learning_rate,
                                         weight_decay=args.weight_decay,
-                                        betas=(0.9, 0.999),
-                                        eps=1e-8)
+                                        betas=(0.9, 0.95),  # Điều chỉnh beta2 cho speech separation
+                                        eps=1e-8,
+                                        amsgrad=False)  # Không dùng AMSGrad
             if (args.distributed and args.local_rank ==0) or args.distributed == False:
-                print("Using AdamW optimizer (recommended)")
+                print(f"Using AdamW optimizer (recommended) - lr: {args.init_learning_rate}, wd: {args.weight_decay}")
+                if args.use_scheduler:
+                    print(f"Learning rate scheduler: {args.scheduler_type}")
     else:
         print(f'in Main, {args.network} is not implemented!')
         return
@@ -133,7 +136,11 @@ if __name__ == '__main__':
     parser.add_argument(
         '--loss-threshold', dest='loss_threshold', type=float, default=-9999.0, help='the mimum loss threshold')
     parser.add_argument('--optimizer_type', type=str, default='adamw', 
-                        choices=['adam', 'adamw'], help='Optimizer type: adam or adamw (default: adamw)') 
+                        choices=['adam', 'adamw'], help='Optimizer type: adam or adamw (default: adamw)')
+    parser.add_argument('--use_scheduler', type=int, default=1, 
+                        help='Use learning rate scheduler (1: yes, 0: no)')
+    parser.add_argument('--scheduler_type', type=str, default='cosine', 
+                        choices=['cosine', 'step', 'plateau'], help='Scheduler type for AdamW') 
     # Distributed training
     parser.add_argument("--local-rank", dest='local_rank', type=int, default=0)
 

@@ -16,15 +16,17 @@ load_type: 'one_input_multi_outputs'
 tr_list: 'data/tr_wsj0_2mix_16k.scp'
 cv_list: 'data/cv_wsj0_2mix_16k.scp'
 
-init_learning_rate: 0.00015 #learning rate for a new training
-finetune_learning_rate: 0.00005 #learning rate for a finetune training
+init_learning_rate: 0.0002 #learning rate for a new training (tăng cho AdamW)
+finetune_learning_rate: 0.00008 #learning rate for a finetune training (tăng cho AdamW)
 
 loss_threshold: -9999.0 #to prevent very low loss
 max_epoch: 120
 
-weight_decay: 0.00001
+weight_decay: 0.01 #tăng weight decay cho AdamW (từ 0.00001 lên 0.01)
 clip_grad_norm: 10.
 optimizer_type: 'adamw'  # 'adam' or 'adamw' (recommended: adamw)
+use_scheduler: 1  # Sử dụng learning rate scheduler cho AdamW
+scheduler_type: 'cosine'  # 'cosine', 'step', 'plateau'
 
 # Log 
 seed: 777
