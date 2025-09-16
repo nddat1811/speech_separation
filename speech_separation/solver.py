@@ -1,12 +1,13 @@
-import time, os
+import time, os, random
 import torch
+import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from losses.loss import loss_mossformer2_ss
-#datnd
-from torch.cuda.amp import GradScaler, autocast
+import logging
+import glob, re
 
 class Solver(object):
     def __init__(self, args, model, optimizer, train_data, validation_data, test_data):
@@ -16,33 +17,29 @@ class Solver(object):
         self.args = args
         self.device = self.args.device
 
+        # Khởi tạo file log console
+        log_dir = self.args.checkpoint_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_file = os.path.join(log_dir, "train.log")
+        # Nếu chưa có file log thì tạo mới
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, "w") as f:
+                f.write("===== Training Log =====\n")
+
         self.print = False
         if (self.args.distributed and self.args.local_rank ==0) or not self.args.distributed:
             self.print = True
+            print("self.print = True")
             self.writer = SummaryWriter('%s/tensorboard/' % args.checkpoint_dir)
 
         self.model = model
         self.optimizer=optimizer
-
-        #datnd
-         # Initialize AMP (Automatic Mixed Precision) - luôn luôn bật
-        if torch.cuda.is_available():
-            self.scaler = GradScaler()
-            self.amp_dtype = torch.float16
-            if self.print:
-                print(f"AMP enabled with dtype: {self.amp_dtype}")
-        else:
-            self.scaler = None
-            self.amp_dtype = None
-            if self.print:
-                print("AMP disabled (CUDA not available)")
-                
         if self.args.distributed:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
             self.model = DDP(self.model, device_ids=[self.args.local_rank],find_unused_parameters=True)
         self._init()
  
-        if self.args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K'] :
+        if self.args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K', 'MossFormer2_SS_8K_adamw'] :
             self._run_one_epoch = self._run_one_epoch_mossformer2_ss
         else:
             print(f'_run_one_epoch is not implemented for {self.args.network}!')
@@ -84,6 +81,7 @@ class Solver(object):
             ckpt_name = os.path.join(self.args.checkpoint_dir, mode)
             if not os.path.isfile(ckpt_name):
                 print('[!] Last checkpoints are not found. Start new training ...')
+                print(f"ckpt link = {self.args.checkpoint_dir}")
                 self.epoch = 0
                 self.step = 0
             return 1
@@ -94,7 +92,7 @@ class Solver(object):
             checkpoint_path = os.path.join(self.args.checkpoint_dir, model_name)
             #checkpoint = self.load_checkpoint(checkpoint_path, use_cuda)
             checkpoint = torch.load(
-                checkpoint_path, map_location=lambda storage, loc: storage)
+                checkpoint_path, weights_only=False, map_location=lambda storage, loc: storage)
             if 'model' in checkpoint:
                 try:
                     self.model.load_state_dict(checkpoint['model'], strict=strict)
@@ -109,8 +107,24 @@ class Solver(object):
             except Exception as e:
                 print(f"self.optimizer is not sucessfully loaded: {e}")
 
-            self.epoch = checkpoint['epoch']
+            self.epoch = checkpoint['epoch'] + 1
             self.step = checkpoint['step']
+            # Khôi phục trạng thái random generator
+            if 'random_state' in checkpoint:
+                random_state = checkpoint['random_state']
+                try:
+                    random.setstate(random_state['python_random_state'])
+                    np.random.set_state(random_state['numpy_random_state'])
+                    torch.set_rng_state(random_state['torch_random_state'])
+                    if random_state['cuda_random_state'] is not None and torch.cuda.is_available():
+                        torch.cuda.set_rng_state(random_state['cuda_random_state'])
+                    print('=> Random states restored successfully')
+                except Exception as e:
+                    print(f"Warning: Failed to restore random states: {e}")
+            # Khôi phục trạng thái dataloader
+            if 'dataloader_state' in checkpoint:
+                self._restore_dataloader_state(checkpoint['dataloader_state'])
+
             print('=> Reloaded previous model and optimizer. Continue training ...')
             return 2
 
@@ -146,21 +160,30 @@ class Solver(object):
             
             # load optimizer only
             if load_optimizer:
-                # self.optimizer.load_state_dict(checkpoint['optimizer'])
-                # for g in self.optimizer.param_groups:
-                #     g['lr'] = self.args.learning_rate
-                #datnd 
-                try:
-                    self.optimizer.load_state_dict(checkpoint['optimizer'])
-                    for g in self.optimizer.param_groups:
-                        g['lr'] = self.args.learning_rate
-                except Exception as e:
-                    if self.print: print(f"Failed to load optimizer state: {e}")
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+                for g in self.optimizer.param_groups:
+                    g['lr'] = self.args.learning_rate
             # load the training states
             elif load_training_stat:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
                 self.epoch=checkpoint['epoch']
                 self.step = checkpoint['step']
+                # Khôi phục trạng thái random generator
+                if 'random_state' in checkpoint:
+                    random_state = checkpoint['random_state']
+                    try:
+                        random.setstate(random_state['python_random_state'])
+                        np.random.set_state(random_state['numpy_random_state'])
+                        torch.set_rng_state(random_state['torch_random_state'])
+                        if random_state['cuda_random_state'] is not None and torch.cuda.is_available():
+                            torch.cuda.set_rng_state(random_state['cuda_random_state'])
+                        if self.print: print('=> Random states restored successfully')
+                    except Exception as e:
+                        if self.print: print(f"Warning: Failed to restore random states: {e}")
+                # Khôi phục trạng thái dataloader
+                if 'dataloader_state' in checkpoint:
+                    self._restore_dataloader_state(checkpoint['dataloader_state'])
+               
                 if self.print: print("Resume training from epoch: {}".format(self.epoch))
 
             else:
@@ -175,15 +198,48 @@ class Solver(object):
     def save_checkpoint(self, mode='last_checkpoint'):
         checkpoint_path = os.path.join(
             self.args.checkpoint_dir, 'model.ckpt-{}-{}.pt'.format(self.epoch, self.step))
+        # Lưu trạng thái random generator
+        random_state = {
+            'python_random_state': random.getstate(),
+            'numpy_random_state': np.random.get_state(),
+            'torch_random_state': torch.get_rng_state(),
+            'cuda_random_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        }
+        # Lưu trạng thái dataloader nếu có
+        dataloader_state = {}
+        if hasattr(self, 'train_data') and hasattr(self.train_data, 'sampler'):
+            if hasattr(self.train_data.sampler, 'epoch'):
+                dataloader_state['sampler_epoch'] = self.train_data.sampler.epoch
+            if hasattr(self.train_data.sampler, 'generator'):
+                dataloader_state['sampler_generator'] = self.train_data.sampler.generator.get_state() if hasattr(self.train_data.sampler.generator, 'get_state') else None
+        
         torch.save({'model': self.model.state_dict(),
                     'optimizer': self.optimizer.state_dict(),
                     'epoch': self.epoch,
-                    'step': self.step}, checkpoint_path)
+                    'step': self.step,
+                    'random_state': random_state,
+                    'dataloader_state': dataloader_state}, checkpoint_path)
 
         with open(os.path.join(self.args.checkpoint_dir, mode), 'w') as f:
             f.write('model.ckpt-{}-{}.pt'.format(self.epoch, self.step))
         print("=> Save checkpoint:", checkpoint_path)
 
+    def _restore_dataloader_state(self, dataloader_state):
+        """Khôi phục trạng thái của dataloader"""
+        try:
+            if hasattr(self, 'train_data') and hasattr(self.train_data, 'sampler'):
+                if 'sampler_epoch' in dataloader_state:
+                    self.train_data.sampler.epoch = dataloader_state['sampler_epoch']
+                    print(f'=> Dataloader epoch restored to: {dataloader_state["sampler_epoch"]}')
+
+                if 'sampler_generator' in dataloader_state and dataloader_state['sampler_generator'] is not None:
+                    if hasattr(self.train_data.sampler, 'generator'):
+                        self.train_data.sampler.generator.set_state(dataloader_state['sampler_generator'])
+                        print('=> Dataloader generator state restored')
+        except Exception as e:
+            print(f"Warning: Failed to restore dataloader state: {e}")
+            
+    ## thinhnh
     def _write_pointer(self, name):
         """Ghi file con trỏ (vd: 'last_checkpoint', 'last_best_checkpoint')."""
         ptr_path = os.path.join(self.args.checkpoint_dir, name)
@@ -225,6 +281,8 @@ class Solver(object):
 
     def train(self):
         start_epoch = self.epoch
+        print(f"Running epoch {start_epoch}...")
+        # print(f"step = {self.step}")
         for epoch in range(start_epoch, self.args.max_epoch+1):
             if self.args.distributed: self.args.train_sampler.set_epoch(epoch)
             # Train
@@ -232,15 +290,33 @@ class Solver(object):
             start = time.time()            
             tr_loss = self._run_one_epoch(data_loader = self.train_data)
             if self.args.distributed: tr_loss = self._reduce_tensor(tr_loss)
-            if self.print: print(f'Train Summary | End of Epoch {epoch} | Time {time.time() - start:2.3f}s | Train Loss {tr_loss:2.4f}')
-
+            # if self.print: print(f'Train Summary | End of Epoch {epoch} | Time {time.time() - start:2.3f}s | Train Loss {tr_loss:2.4f}')
+            if self.print:
+                msg = (
+                        f"Train Summary | End of Epoch {epoch} "
+                        f"| Time {time.time() - start:2.3f}s "
+                        f"| Train Loss {tr_loss:2.4f}"
+                    )
+                print(msg)  # in ra màn hình
+                with open(self.log_file, "a") as f:  # ghi thêm vào cuối file log
+                        f.write(msg + "\n")
             # Validation
             self.model.eval()
+            print("Validating...Please Wait!")
             start = time.time()
             with torch.no_grad():
                 val_loss = self._run_one_epoch(data_loader = self.validation_data, state='val')
                 if self.args.distributed: val_loss = self._reduce_tensor(val_loss)
-            if self.print: print(f'Valid Summary | End of Epoch {epoch} | Time {time.time() - start:2.3f}s | Valid Loss {val_loss:2.4f}')
+            # if self.print: print(f'Valid Summary | End of Epoch {epoch} | Time {time.time() - start:2.3f}s | Valid Loss {val_loss:2.4f}')
+            if self.print:
+                msg = (
+                        f"Val Summary | End of Epoch {epoch} "
+                        f"| Time {time.time() - start:2.3f}s "
+                        f"| Val Loss {val_loss:2.4f}"
+                    )
+                print(msg)  # in ra màn hình
+                with open(self.log_file, "a") as f:  # ghi thêm vào cuối file log
+                        f.write(msg + "\n")
           
             if self.args.tt_list is not None:
                 # Test
@@ -250,34 +326,25 @@ class Solver(object):
                     test_loss = self._run_one_epoch(data_loader = self.test_data, state='test')
                     if self.args.distributed: test_loss = self._reduce_tensor(test_loss)
                 if self.print: print(f'Test Summary | End of Epoch {epoch} | Time {time.time() - start:2.3f}s | Test Loss {test_loss:2.4f}')
+            
+
 
             # Check whether to early stop and to reduce learning rate
-            # find_best_model = False
-            # if val_loss < self.best_val_loss:
-            #     self.best_val_loss = val_loss
-            #     self.val_no_impv = 0  # reset vì đã cải thiện
-            #     find_best_model = True
-            # else:
-            #     self.val_no_impv += 1
-            #     if self.val_no_impv == 5:
-            #         self.halving = True
-            #     elif self.val_no_impv >= 10:
-            #         if self.print: print("No improvement for 10 epochs, early stopping.")
-            #         break
-            #datnd
+            print(f"best_val_loss = {self.best_val_loss}")
+            print(f"val_loss = {val_loss}")
             find_best_model = False
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.val_no_impv = 0  # reset vì đã cải thiện
-                find_best_model = True
-            else:
+            if val_loss >= self.best_val_loss:
+                # self.best_val_loss = val_loss
                 self.val_no_impv += 1
                 if self.val_no_impv == 5:
                     self.halving = True
                 elif self.val_no_impv >= 10:
-                    if self.print: print("No improvement for 10 epochs, early stopping.")
+                    if self.print: print("No imporvement for 10 epochs, early stopping.")
                     break
-
+            else:
+                self.val_no_impv = 0
+                self.best_val_loss = val_loss
+                find_best_model=True
 
             # Halfing the learning rate
             if self.halving:
@@ -298,163 +365,100 @@ class Solver(object):
                 if self.args.tt_list is not None:
                     self.writer.add_scalar('Test_loss', test_loss, epoch)
 
-            # # Save model
-            # self.save_checkpoint()
-            # if find_best_model:
-            #     print("Found new best model, dict saved")
-            #     self.save_checkpoint(mode='last_best_checkpoint')
-            # self.epoch = self.epoch + 1
-
-            # Thinhnht
+            # Save model
             # Save the latest checkpoint (+ cập nhật last_checkpoint)
-            
+            self.save_checkpoint()
 
-            
-
-            # Sau mỗi epoch: dọn rác, giữ lại 3 checkpoint gần nhất (không xóa bản best)
-            # self._purge_old_checkpoints(keep_last=3)
-
-            self.epoch = self.epoch + 1
             # Nếu là best: chỉ cần cập nhật con trỏ last_best_checkpoint (không ghi file lại)
             if find_best_model:
                 if self.print: print("Found new best model")
                 self._write_pointer('last_best_checkpoint')
-            #Thinhnt 01/09
-            self.save_checkpoint()
-            
-            # Thinhnht
+
+            self.epoch = self.epoch + 1
 
     def _run_one_epoch_mossformer2_ss(self, data_loader, state='train'):
         num_batch = len(data_loader)
         mix_loss_print = 0.0
-
         total_loss = 0.0
         self.accu_count = 0
         self.optimizer.zero_grad()
         stime = time.time()
-
-        
+        thinh = 0
         for i, (inputs, labels) in enumerate(data_loader):
+            # if thinh % 50 == 0:
+            #     # print(f"input shape = {inputs.shape}, label shape = {labels.shape}")
+            #     print(f"input = {inputs}")
+            #     # print(inputs.shape)
+            # thinh+=1
+            # if i % 50 == 0:
+            #   print(f"i = {i}")
+
             inputs = inputs.to(self.device)
             labels = labels.to(self.device)
 
-            #datnd
-             # Use AMP for forward pass
-            if self.scaler is not None:
-                with autocast(dtype=self.amp_dtype):
-                    Out_List = self.model(inputs)
-                    loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
-            else:
-                Out_List = self.model(inputs)
-                loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
 
-            # Out_List = self.model(inputs)
-            # loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
+            Out_List = self.model(inputs)
+            loss = loss_mossformer2_ss(self.args, inputs, labels, Out_List, self.device)
 
-            # if state=='train':
-            #     if self.args.accu_grad:
-            #         self.accu_count += 1
-            #         loss_bw = loss[loss > self.args.loss_threshold]
-            #         if loss_bw.nelement() > 0:
-            #             loss_bw = loss_bw.mean()
-            #             if loss_bw < 999999:
-            #                 loss_scaled = loss_bw/(self.args.effec_batch_size / self.args.batch_size)
-            #                 loss_scaled.backward()
-            #                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-          
-            #         if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
-            #             self.optimizer.step()
-            #             self.optimizer.zero_grad()
-            #             self.accu_count = 0
-                # else:
-                #     loss_bw = loss[loss > self.args.loss_threshold]
-                #     if loss_bw.nelement() > 0:
-                #         loss_bw = loss_bw.mean()
-                #         if loss_bw < 999999:
-                #             loss_bw.backward()
-                #             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                #             self.optimizer.step()
-                #             self.optimizer.zero_grad()
             if state=='train':
-                did_backward = False   # flag
-                
                 if self.args.accu_grad:
                     self.accu_count += 1
                     loss_bw = loss[loss > self.args.loss_threshold]
-                    if self.args.accu_grad:
-                        self.accu_count += 1
-                        loss_bw = loss[loss > self.args.loss_threshold]
-                        if loss_bw.nelement() > 0:
-                            loss_bw = loss_bw.mean()
-                            if loss_bw < 999999:
-                                loss_scaled = loss_bw / (self.args.effec_batch_size / self.args.batch_size)
+                    if loss_bw.nelement() > 0:
+                        loss_bw = loss_bw.mean()
+                        if loss_bw < 999999:
+                            loss_scaled = loss_bw/(self.args.effec_batch_size / self.args.batch_size)
+                            loss_scaled.backward()
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+          
+                    if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        self.accu_count = 0
 
-                                if self.scaler is not None:
-                                    self.scaler.scale(loss_scaled).backward()
-                                else:
-                                    loss_scaled.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                                did_backward = True
-
-                        # chỉ step khi accumulate đủ và đã backward
-                        if self.accu_count == (self.args.effec_batch_size / self.args.batch_size):
-                            if did_backward:
-                                if self.scaler is not None:
-                                    self.scaler.step(self.optimizer)
-                                    self.scaler.update()
-                                else:
-                                    self.optimizer.step()
-                            self.optimizer.zero_grad()
-                            self.accu_count = 0
-                
                 else:
                     loss_bw = loss[loss > self.args.loss_threshold]
                     if loss_bw.nelement() > 0:
                         loss_bw = loss_bw.mean()
                         if loss_bw < 999999:
-                            # Use AMP for backward pass
-                            if self.scaler is not None:
-                                self.scaler.scale(loss_bw).backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                                self.scaler.step(self.optimizer)
-                                self.scaler.update()
-                            else:
-                                loss_bw.backward()
-                                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
-                                self.optimizer.step()
-                            
+                            loss_bw.backward()
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad_norm)
+                            self.optimizer.step()
                             self.optimizer.zero_grad()
-                            did_backward = True
-
-                # logging + loss tracking
-                if 'loss_bw' in locals() and loss_bw.nelement() > 0:
-                    total_loss += loss_bw.detach()
-                    mix_loss_print += loss_bw.detach().cpu()
 
                 self.step += 1
                 ##cal losses for printing
-                # mix_loss_print += loss_bw.data.cpu()
+                mix_loss_print += loss_bw.data.cpu()
                 if (i + 1) % self.args.print_freq == 0:
                     eplashed = time.time() - stime
                     speed_avg = eplashed / (i+1)
                     mix_loss_print_avg = mix_loss_print / self.args.print_freq
-                    #datnd
-                    # if self.print: print('{} Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
+                    # if self.print: print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
                     #   ' Total_Loss {:2.4f}'
-                    #   .format(state.capitalize(), self.epoch, self.args.max_epoch,
+                    #   .format(self.epoch, self.args.max_epoch,
                     #       i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
                     #       mix_loss_print_avg,
                     #     ))
-                    
-                    if self.print: print('Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} |'
-                      ' Total_Loss {:2.4f}'
-                      .format(self.epoch, self.args.max_epoch,
-                          i+1, num_batch, speed_avg, self.optimizer.param_groups[0]["lr"],
-                          mix_loss_print_avg,
-                        ))
+                    if self.print:
+                        msg = (
+                            'Train Epoch: {}/{} Step: {}/{} | {:2.3f}s/batch | lr {:1.4e} | Total_Loss {:2.4f}'
+                            .format(
+                                self.epoch,
+                                self.args.max_epoch,
+                                i+1,
+                                num_batch,
+                                speed_avg,
+                                self.optimizer.param_groups[0]["lr"],
+                                mix_loss_print_avg,
+                            )
+                        )
+                        print(msg)  
+                        # with open(self.log_file, "a") as f:  
+                        #     f.write(msg + "\n")
                     mix_loss_print = 0.0
                 if (i + 1) % self.args.checkpoint_save_freq == 0:
                     self.save_checkpoint()
+                    self._purge_old_checkpoints(keep_last=3)
             else:
                 loss_bw = loss
                 loss_bw = loss_bw.mean()
