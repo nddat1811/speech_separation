@@ -239,7 +239,7 @@ class Solver(object):
         except Exception as e:
             print(f"Warning: Failed to restore dataloader state: {e}")
             
-    ## thinhnh
+    ## count_epochnh
     def _write_pointer(self, name):
         """Ghi file con trỏ (vd: 'last_checkpoint', 'last_best_checkpoint')."""
         ptr_path = os.path.join(self.args.checkpoint_dir, name)
@@ -369,11 +369,15 @@ class Solver(object):
             # Save the latest checkpoint (+ cập nhật last_checkpoint)
             self.save_checkpoint()
 
+
             # Nếu là best: chỉ cần cập nhật con trỏ last_best_checkpoint (không ghi file lại)
             if find_best_model:
                 if self.print: print("Found new best model")
                 self._write_pointer('last_best_checkpoint')
 
+            # Xóa checkpoint cũ
+            self._purge_old_checkpoints(keep_last=3)
+            
             self.epoch = self.epoch + 1
 
     def _run_one_epoch_mossformer2_ss(self, data_loader, state='train'):
@@ -383,13 +387,13 @@ class Solver(object):
         self.accu_count = 0
         self.optimizer.zero_grad()
         stime = time.time()
-        thinh = 0
+        count_epoch = 0
         for i, (inputs, labels) in enumerate(data_loader):
-            # if thinh % 50 == 0:
-            #     # print(f"input shape = {inputs.shape}, label shape = {labels.shape}")
-            #     print(f"input = {inputs}")
-            #     # print(inputs.shape)
-            # thinh+=1
+            if count_epoch % 300 == 0:
+                # print(f"input shape = {inputs.shape}, label shape = {labels.shape}")
+                print(f"input = {inputs}")
+                # print(inputs.shape)
+            count_epoch+=1
             # if i % 50 == 0:
             #   print(f"i = {i}")
 

@@ -13,33 +13,25 @@ num_mossformer_layer: 24
 
 # Train
 load_type: 'one_input_multi_outputs'
-# tr_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/train-360_Libri2Mix_clean_8k_min_360.scp'
-# cv_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/val_Libri2Mix_clean_8k_min_360.scp'
+tr_list: 'data/LibriMix/2speakers/wav8k/min/train-100_Libri2Mix_clean_from360.scp'
+cv_list: 'data/LibriMix/2speakers/wav8k/min/val_Libri2Mix_clean.scp'
 
-tr_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/train-100_Libri2Mix_clean_8k_min_100.scp'
-cv_list: '/home/IT2021-XLTHSNC/speech_separation/dataset/Libri2Mix/wav8k/min/val_Libri2Mix_clean_8k_min_100.scp'
-# init_learning_rate: 0.00015 #learning rate for a new training
-# finetune_learning_rate: 0.00005 #learning rate for a finetune training
+init_learning_rate: 0.00015 #learning rate for a new training
+finetune_learning_rate: 0.00005 #learning rate for a finetune training
 
 loss_threshold: -9999.0 #to prevent very low loss
-max_epoch: 200
+max_epoch: 200 #default 120
 
 weight_decay: 0.00001
 clip_grad_norm: 10.
-
+optimizer_type: 'adam'  # 'adam' or 'adamw' (recommended: adamw)
 # Log 
-seed: 777
+seed: 1811
 
 # # dataset
 num_workers: 4
-# batch_size: 4
+batch_size: 1
 accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
-# effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
+effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
 max_length: 2         # truncate the utterances in dataloader, in seconds 
-
-batch_size: 6
-effec_batch_size: 6
-
-init_learning_rate: 0.0009
-finetune_learning_rate: 0.0003
 

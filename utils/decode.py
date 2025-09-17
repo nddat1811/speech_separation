@@ -17,11 +17,6 @@ MAX_WAV_VALUE = 32768.0
 
 def decode_one_audio(model, device, inputs, args):
     if args.network in ['MossFormer2_SS_16K', 'MossFormer2_SS_8K']:
-        # Ensure sampling rate matches the selected network
-        if '16K' in args.network:
-            args.sampling_rate = 16000
-        elif '8K' in args.network:
-            args.sampling_rate = 8000
         return decode_one_audio_mossformer2_ss(model, device, inputs, args)
     else:
        print(f"in decode, {args.network} is not found!")

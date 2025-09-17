@@ -3,7 +3,7 @@ import numpy as np
 
 import torch
 from dataloader.dataloader import get_dataloader
-from solver_v1 import Solver #only delete ckpt
+from solver import Solver #only delete ckpt
 
 import sys
 sys.path.append('../../')

@@ -10,7 +10,7 @@ class network_wrapper(nn.Module):
     def __init__(self, args):
         super(network_wrapper, self).__init__()
         self.args = args
-        if args.network in ['MossFormer2_SS_16K', 'MossFormer2_SS_8K']:
+        if args.network in ['MossFormer2_SS_16K', 'MossFormer2_SS_8K', 'MossFormer2_SS_8K_noise']:
             from models.mossformer2.mossformer2 import MossFormer2_SS
             self.ss_network = MossFormer2_SS(args).model
         else:
