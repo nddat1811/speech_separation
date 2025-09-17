@@ -16,13 +16,24 @@ from utils.misc import power_compress, power_uncompress, stft, istft, compute_fb
 MAX_WAV_VALUE = 32768.0
 
 def decode_one_audio(model, device, inputs, args):
-    if args.network == 'MossFormer2_SS_16K':
-        return decode_one_audio_mossformer2_ss_16k(model, device, inputs, args)
+    if args.network in ['MossFormer2_SS_16K', 'MossFormer2_SS_8K']:
+        # Ensure sampling rate matches the selected network
+        if '16K' in args.network:
+            args.sampling_rate = 16000
+        elif '8K' in args.network:
+            args.sampling_rate = 8000
+        return decode_one_audio_mossformer2_ss(model, device, inputs, args)
     else:
-       print("in decode, {args.network} is found!")
+       print(f"in decode, {args.network} is not found!")
        return 
 
-def decode_one_audio_mossformer2_ss_16k(model, device, inputs, args):
+def decode_one_audio_mossformer2_ss(model, device, inputs, args):
+    """
+    Giải mã một đoạn audio cho MossFormer2 Speech Separation.
+    Hàm này dùng chung cho cả 8k và 16k. Tần số lấy mẫu được lấy từ args.sampling_rate
+    (đã được thiết lập theo network ở decode_one_audio), nên chỉ cần đảm bảo
+    args.sampling_rate = 8000 cho 'MossFormer2_SS_8K' hoặc = 16000 cho 'MossFormer2_SS_16K'.
+    """
     out = []
     #inputs, utt_id, nsamples = data_reader[idx]
     decode_do_segement = False

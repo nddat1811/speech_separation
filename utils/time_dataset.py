@@ -207,7 +207,8 @@ def make_loader(scp_file_name, batch_size, num_workers=12, processer=Processer()
                             num_workers=num_workers,
                             collate_fn=collate_fn,
                             shuffle=True,
-                            drop_last=False
+                            #drop last if enable, the last batch will be dropped if the batch size is not divisible by the number of workers
+                            drop_last=True
                         )
     return loader, dataset
  
