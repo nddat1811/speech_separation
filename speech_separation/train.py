@@ -3,7 +3,7 @@ import numpy as np
 
 import torch
 from dataloader.dataloader import get_dataloader
-from solver import Solver
+from solver_v1 import Solver #only delete ckpt
 
 import sys
 sys.path.append('../../')
@@ -33,12 +33,26 @@ def main(args):
         #print("\nTotal number of model parameters: {} \n".format(sum(p.numel() for p in model.parameters())))
         print("\nTổng số parameters của mô hình là: {} \n".format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
         
-    
     if args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K']:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.init_learning_rate)
+          optimizer = torch.optim.Adam(model.parameters(), lr=args.init_learning_rate)
+          # Sử dụng AdamW thay vì Adam để có kết quả tốt hơn
+          # AdamW xử lý weight decay đúng cách hơn và thường cho kết quả tốt hơn
+          if args.optimizer_type == 'adam':
+              optimizer = torch.optim.Adam(model.parameters(), lr=args.init_learning_rate)
+              if (args.distributed and args.local_rank ==0) or args.distributed == False:
+                  print("Using Adam optimizer")
+          else:
+              # Mặc định sử dụng AdamW
+              optimizer = torch.optim.AdamW(model.parameters(), 
+                                          lr=args.init_learning_rate,
+                                          weight_decay=args.weight_decay,
+                                          betas=(0.9, 0.999),
+                                          eps=1e-8)
+              if (args.distributed and args.local_rank ==0) or args.distributed == False:
+                  print("Using AdamW optimizer (recommended)")
     else:
-        print(f'in Main, {args.network} is not implemented!')
-        return
+          print(f'in Main, {args.network} is not implemented!')
+          return
 
     train_sampler, train_generator = get_dataloader(args,'train')
     _, val_generator = get_dataloader(args, 'val')
@@ -107,6 +121,8 @@ if __name__ == '__main__':
     parser.add_argument('--clip-grad-norm', dest='clip_grad_norm', type=float, default=10.)
     parser.add_argument(
         '--loss-threshold', dest='loss_threshold', type=float, default=-9999.0, help='the mimum loss threshold') 
+    parser.add_argument('--optimizer_type', type=str, default='adamw', 
+                        choices=['adam', 'adamw'], help='Optimizer type: adam or adamw (default: adamw)') 
     # Distributed training
     parser.add_argument("--local-rank", dest='local_rank', type=int, default=0)
 
@@ -120,7 +136,5 @@ if __name__ == '__main__':
         args.world_size = int(os.environ['WORLD_SIZE'])
     assert torch.backends.cudnn.enabled, "cudnn needs to be enabled"
     main(args)
-
-
 
 
