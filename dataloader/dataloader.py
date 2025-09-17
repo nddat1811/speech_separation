@@ -1,8 +1,3 @@
-"""
-Implement dataloader for speech separation
-Modifier: Shengkui Zhao
-"""
-
 import numpy as np
 import math, os, csv
 import torchaudio
@@ -111,8 +106,9 @@ class Wave_Processor(object):
         try:
             wave_inputs = audioread(path['inputs'], sampling_rate)        
             wave_labels = audioread_multi_wavs(path['labels'], sampling_rate)
-        except:
-            print('audioread() failed, skip this batch!')
+        except Exception as e:
+            #datnd 30/08/2025
+            print(f'audioread() failed, skip this batch! multi_labels Input: {path["inputs"]}, Labels: {path["labels"]}, Error: {str(e)}') 
             return None, None
         max_len = max(wave_inputs.shape[0], wave_labels.shape[0])
         if max_len < segment_length:
@@ -191,7 +187,16 @@ class AudioDataset(Dataset):
                 index = index + 1
                 if index >= len(self.wav_list): index = random.randint(0, len(self.wav_list)-1)
                 data_info = self.wav_list[index]        
-        return inputs, labels 
+        return inputs, labels
+        
+        # If we've exhausted all retries, return a dummy sample to prevent crashes
+        print(f'Failed to load any valid audio after {max_retries} retries, returning dummy sample')
+        dummy_inputs = np.zeros(self.segment_length, dtype=np.float32)
+        if self.args.load_type == 'one_input_multi_outputs':
+            dummy_labels = np.zeros((self.segment_length, len(data_info['labels'])), dtype=np.float32)
+        else:
+            dummy_labels = np.zeros(self.segment_length, dtype=np.float32)
+        return dummy_inputs, dummy_labels
 
 def zero_pad_concat(self, inputs):
     max_t = max(inp.shape[0] for inp in inputs)
