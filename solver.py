@@ -109,6 +109,18 @@ class Solver(object):
 
             self.epoch = checkpoint['epoch'] + 1
             self.step = checkpoint['step']
+            
+            # Khôi phục thông tin early stopping
+            if 'val_no_impv' in checkpoint:
+                self.val_no_impv = checkpoint['val_no_impv']
+                print(f'=> val_no_impv restored to: {self.val_no_impv}')
+            if 'best_val_loss' in checkpoint:
+                self.best_val_loss = checkpoint['best_val_loss']
+                print(f'=> best_val_loss restored to: {self.best_val_loss}')
+            if 'halving' in checkpoint:
+                self.halving = checkpoint['halving']
+                print(f'=> halving restored to: {self.halving}')
+                
             # Khôi phục trạng thái random generator
             if 'random_state' in checkpoint:
                 random_state = checkpoint['random_state']
@@ -168,6 +180,18 @@ class Solver(object):
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
                 self.epoch=checkpoint['epoch']
                 self.step = checkpoint['step']
+                
+                # Khôi phục thông tin early stopping
+                if 'val_no_impv' in checkpoint:
+                    self.val_no_impv = checkpoint['val_no_impv']
+                    if self.print: print(f'=> val_no_impv restored to: {self.val_no_impv}')
+                if 'best_val_loss' in checkpoint:
+                    self.best_val_loss = checkpoint['best_val_loss']
+                    if self.print: print(f'=> best_val_loss restored to: {self.best_val_loss}')
+                if 'halving' in checkpoint:
+                    self.halving = checkpoint['halving']
+                    if self.print: print(f'=> halving restored to: {self.halving}')
+                
                 # Khôi phục trạng thái random generator
                 if 'random_state' in checkpoint:
                     random_state = checkpoint['random_state']
@@ -218,7 +242,10 @@ class Solver(object):
                     'epoch': self.epoch,
                     'step': self.step,
                     'random_state': random_state,
-                    'dataloader_state': dataloader_state}, checkpoint_path)
+                    'dataloader_state': dataloader_state,
+                    'val_no_impv': self.val_no_impv,
+                    'best_val_loss': self.best_val_loss,
+                    'halving': self.halving}, checkpoint_path)
 
         with open(os.path.join(self.args.checkpoint_dir, mode), 'w') as f:
             f.write('model.ckpt-{}-{}.pt'.format(self.epoch, self.step))

@@ -13,8 +13,8 @@ num_mossformer_layer: 24
 
 # Train
 load_type: 'one_input_multi_outputs'
-tr_list: 'data/LibriMix/2speakers/wav8k/min/train-100_Libri2Mix_clean_from360.scp'
-cv_list: 'data/LibriMix/2speakers/wav8k/min/val_Libri2Mix_clean.scp'
+tr_list: '/kaggle/working/speech_separation/data/train_MiniLibri_clean.scp'
+cv_list: '/kaggle/working/speech_separation/data/val_MiniLibri_clean.scp'
 
 init_learning_rate: 0.00015 #learning rate for a new training
 finetune_learning_rate: 0.00005 #learning rate for a finetune training
@@ -34,4 +34,3 @@ batch_size: 1
 accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
 effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
 max_length: 2         # truncate the utterances in dataloader, in seconds 
-
