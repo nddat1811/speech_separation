@@ -376,7 +376,13 @@ class Solver(object):
             # Halfing the learning rate
             if self.halving:
                 self.halving = False
+                # Lưu epoch hiện tại trước khi reload
+                current_epoch = self.epoch
+                current_step = self.step
                 self._load_model(mode='last_best_checkpoint')
+                # Khôi phục lại epoch và step hiện tại
+                self.epoch = current_epoch
+                self.step = current_step
                 if self.print: print('reload from last best checkpoint')
 
                 optim_state = self.optimizer.state_dict()
