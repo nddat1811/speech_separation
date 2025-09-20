@@ -379,6 +379,7 @@ class Solver(object):
                 # Lưu epoch hiện tại trước khi reload
                 current_epoch = self.epoch
                 current_step = self.step
+                old_lr = self.optimizer.param_groups[0]['lr']
                 self._load_model(mode='last_best_checkpoint')
                 # Khôi phục lại epoch và step hiện tại
                 self.epoch = current_epoch
@@ -388,7 +389,14 @@ class Solver(object):
                 optim_state = self.optimizer.state_dict()
                 optim_state['param_groups'][0]['lr'] *= 0.5
                 self.optimizer.load_state_dict(optim_state)
-                if self.print: print('Learning rate adjusted to: {lr:.6f}'.format(lr=optim_state['param_groups'][0]['lr']))
+                new_lr = optim_state['param_groups'][0]['lr']
+                if self.print: 
+                    print('Learning rate adjusted to: {lr:.6f}'.format(lr=new_lr))
+                    # Ghi vào file log
+                    lr_msg = f"LR SCHEDULE | Epoch {current_epoch} | LR reduced from {old_lr:.6f} to {new_lr:.6f} (50% reduction) | val_no_impv: {self.val_no_impv}"
+                    print(lr_msg)
+                    with open(self.log_file, "a") as f:
+                        f.write(lr_msg + "\n")
                 
 
             if self.print:
