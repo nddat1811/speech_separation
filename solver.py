@@ -360,7 +360,7 @@ class Solver(object):
             print(f"best_val_loss = {self.best_val_loss}")
             print(f"val_loss = {val_loss}")
             find_best_model = False
-            if val_loss >= self.best_val_loss:
+            if val_loss > self.best_val_loss:  # Tệ hơn (loss cao hơn)
                 # self.best_val_loss = val_loss
                 self.val_no_impv += 1
                 if self.val_no_impv == 5:
@@ -387,16 +387,26 @@ class Solver(object):
                 if self.print: print('reload from last best checkpoint')
 
                 optim_state = self.optimizer.state_dict()
-                optim_state['param_groups'][0]['lr'] *= 0.5
-                self.optimizer.load_state_dict(optim_state)
-                new_lr = optim_state['param_groups'][0]['lr']
-                if self.print: 
-                    print('Learning rate adjusted to: {lr:.6f}'.format(lr=new_lr))
-                    # Ghi vào file log
-                    lr_msg = f"LR SCHEDULE | Epoch {current_epoch} | LR reduced from {old_lr:.6f} to {new_lr:.6f} (50% reduction) | val_no_impv: {self.val_no_impv}"
-                    print(lr_msg)
-                    with open(self.log_file, "a") as f:
-                        f.write(lr_msg + "\n")
+                new_lr = old_lr * 0.5
+                
+                # Kiểm tra nếu LR quá nhỏ thì dừng giảm LR
+                if new_lr < 1e-8:
+                    if self.print:
+                        print(f'Learning rate too small ({new_lr:.8f}), stopping LR reduction')
+                        lr_msg = f"LR SCHEDULE | Epoch {current_epoch} | LR reduction SKIPPED (LR too small: {old_lr:.8f}) | val_no_impv: {self.val_no_impv}"
+                        print(lr_msg)
+                        with open(self.log_file, "a") as f:
+                            f.write(lr_msg + "\n")
+                else:
+                    optim_state['param_groups'][0]['lr'] = new_lr
+                    self.optimizer.load_state_dict(optim_state)
+                    if self.print: 
+                        print('Learning rate adjusted to: {lr:.8f}'.format(lr=new_lr))
+                        # Ghi vào file log
+                        lr_msg = f"LR SCHEDULE | Epoch {current_epoch} | LR reduced from {old_lr:.8f} to {new_lr:.8f} (50% reduction) | val_no_impv: {self.val_no_impv}"
+                        print(lr_msg)
+                        with open(self.log_file, "a") as f:
+                            f.write(lr_msg + "\n")
                 
 
             if self.print:
