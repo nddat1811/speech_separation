@@ -379,11 +379,13 @@ class Solver(object):
                 # Lưu epoch hiện tại trước khi reload
                 current_epoch = self.epoch
                 current_step = self.step
+                current_val_no_impv = self.val_no_impv  # Lưu val_no_impv hiện tại
                 old_lr = self.optimizer.param_groups[0]['lr']
                 self._load_model(mode='last_best_checkpoint')
-                # Khôi phục lại epoch và step hiện tại
+                # Khôi phục lại epoch, step và val_no_impv hiện tại
                 self.epoch = current_epoch
                 self.step = current_step
+                self.val_no_impv = current_val_no_impv  # Khôi phục val_no_impv
                 if self.print: print('reload from last best checkpoint')
 
                 optim_state = self.optimizer.state_dict()
