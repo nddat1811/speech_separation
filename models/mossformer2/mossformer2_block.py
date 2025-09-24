@@ -547,10 +547,11 @@ class MossformerBlock(nn.Module):
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         if use_flash_attn and HAS_FLASH_ATTN:
             self.layers = nn.ModuleList([
-                FlashMHA(
+                FlashGroupedMHA(
                     dim = dim,
                     n_heads = max(1, dim // max(1, query_key_dim)),
                     head_dim = max(1, min(query_key_dim, dim)),
+                    group_size = group_size,
                     dropout = attn_dropout,
                     causal = causal,
                     norm_klass = norm_klass,
@@ -626,6 +627,69 @@ class FlashMHA(nn.Module):
         )
 
         out = out.reshape(b, n, self.n_heads * self.head_dim)
+        out = self.out_proj(out)
+        return residual + out
+
+
+class FlashGroupedMHA(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        n_heads,
+        head_dim,
+        group_size,
+        dropout = 0.1,
+        causal = False,
+        norm_klass = nn.LayerNorm
+    ):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.group_size = group_size
+        self.dropout_p = dropout
+        self.causal = causal
+        self.norm = norm_klass(dim)
+
+        total_qkv_dim = n_heads * head_dim
+        self.qkv_proj = nn.Linear(dim, 3 * total_qkv_dim, bias=False)
+        self.out_proj = nn.Linear(total_qkv_dim, dim, bias=False)
+
+    def forward(self, x, mask=None):
+        b, n, d = x.shape
+        residual = x
+        x = self.norm(x)
+
+        total_qkv_dim = self.n_heads * self.head_dim
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(b, n, 3, self.n_heads, self.head_dim)
+
+        # pad sequence to multiple of group_size
+        g = self.group_size
+        pad = padding_to_multiple_of(n, g)
+        if pad > 0:
+            qkv = F.pad(qkv, (0, 0, 0, 0, 0, 0, 0, pad), value=0.0)
+        n_padded = n + pad
+
+        # reshape to groups and merge batch*groups
+        qkv = rearrange(qkv, 'b (G t) three h d -> (b G) t three h d', t=g)
+
+        # run flash-attn per group (batched)
+        out = flash_attn_qkvpacked_func(
+            qkv,
+            dropout_p=(self.dropout_p if self.training else 0.0),
+            softmax_scale=None,
+            causal=self.causal,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+
+        # restore shape and remove padding
+        out = rearrange(out, '(b G) t h d -> b (G t) (h d)', G=(n_padded // g))
+        out = out[:, :n]
+
         out = self.out_proj(out)
         return residual + out
 
