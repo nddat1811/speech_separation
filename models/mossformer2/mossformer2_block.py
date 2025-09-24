@@ -16,6 +16,13 @@ from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
 # functions
 
+# Optional FlashAttention v2 import
+try:
+    from flash_attn import flash_attn_func, flash_attn_qkvpacked_func  # noqa: F401
+    HAS_FLASH_ATTN = True
+except Exception:
+    HAS_FLASH_ATTN = False
+
 def identity(t, *args, **kwargs):
     return t
 
@@ -523,7 +530,8 @@ class MossformerBlock(nn.Module):
         causal = False,
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
-        shift_tokens = True
+        shift_tokens = True,
+        use_flash_attn = False
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -537,7 +545,19 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        if use_flash_attn and HAS_FLASH_ATTN:
+            self.layers = nn.ModuleList([
+                FlashMHA(
+                    dim = dim,
+                    n_heads = max(1, dim // max(1, query_key_dim)),
+                    head_dim = max(1, min(query_key_dim, dim)),
+                    dropout = attn_dropout,
+                    causal = causal,
+                    norm_klass = norm_klass,
+                ) for _ in range(depth)
+            ])
+        else:
+            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -557,4 +577,55 @@ class MossformerBlock(nn.Module):
             x = flash(x, mask = mask)
             ii = ii + 1
         return x
+
+
+class FlashMHA(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        n_heads,
+        head_dim,
+        dropout = 0.1,
+        causal = False,
+        norm_klass = nn.LayerNorm
+    ):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.dropout_p = dropout
+        self.causal = causal
+        self.norm = norm_klass(dim)
+
+        total_qkv_dim = n_heads * head_dim
+        # If dim is not divisible, project to nearest multiple for QKV and back to dim
+        self.q_proj = nn.Linear(dim, total_qkv_dim, bias=False)
+        self.k_proj = nn.Linear(dim, total_qkv_dim, bias=False)
+        self.v_proj = nn.Linear(dim, total_qkv_dim, bias=False)
+        self.out_proj = nn.Linear(total_qkv_dim, dim, bias=False)
+
+    def forward(self, x, mask=None):
+        b, n, d = x.shape
+        residual = x
+        x = self.norm(x)
+
+        q = self.q_proj(x).view(b, n, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(b, n, self.n_heads, self.head_dim)
+        v = self.v_proj(x).view(b, n, self.n_heads, self.head_dim)
+
+        # FlashAttention v2 call; dropout only in training
+        out = flash_attn_func(
+            q, k, v,
+            dropout_p=(self.dropout_p if self.training else 0.0),
+            softmax_scale=None,
+            causal=self.causal,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            deterministic=False,
+        )
+
+        out = out.reshape(b, n, self.n_heads * self.head_dim)
+        out = self.out_proj(out)
+        return residual + out
 

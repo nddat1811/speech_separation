@@ -388,19 +388,21 @@ class MossFormerM2(nn.Module):
         group_size = 256,
         query_key_dim = 128,
         expansion_factor = 4.,
-        attn_dropout = 0.1
+        attn_dropout = 0.1,
+        use_flash_attn = True
     ):
         super().__init__()
 
         self.mossformerM = MossformerBlock(
-                           dim=d_model,
-                           depth=num_blocks,
-                           group_size=group_size,
-                           query_key_dim=query_key_dim,
-                           expansion_factor=expansion_factor,
-                           causal=causal,
-                           attn_dropout=attn_dropout
-                              )
+                            dim=d_model,
+                            depth=num_blocks,
+                            group_size=group_size,
+                            query_key_dim=query_key_dim,
+                            expansion_factor=expansion_factor,
+                            causal=causal,
+                            attn_dropout=attn_dropout,
+                            use_flash_attn=use_flash_attn
+                        )
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
     def forward(
