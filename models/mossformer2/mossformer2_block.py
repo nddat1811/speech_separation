@@ -10,6 +10,7 @@ from torch import nn, einsum
 from torchinfo import summary
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
+import os
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
@@ -278,6 +279,10 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
     def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
+
+        if os.environ.get('MOSSFORMER_LOG_SEQINFO', '0') == '1':
+            groups = (n + g - 1) // g
+            print(f"[FA-Fallback cal_attention] B={b} T={n} group_size={g} groups={groups}")
 
         if exists(mask):
             lin_mask = rearrange(mask, '... -> ... 1')
@@ -681,6 +686,10 @@ class FlashGroupedMHA(nn.Module):
         if pad > 0:
             qkv = F.pad(qkv, (0, 0, 0, 0, 0, 0, 0, pad), value=0.0)
         n_padded = n + pad
+
+        if os.environ.get('MOSSFORMER_LOG_SEQINFO', '0') == '1':
+            groups = (n + g - 1) // g
+            print(f"[FlashGroupedMHA] B={b} T={n} group_size={g} groups={groups} heads={self.n_heads} head_dim={self.head_dim}")
 
         # reshape to groups and merge batch*groups
         qkv = rearrange(qkv, 'b (G t) three h d -> (b G) t three h d', t=g)
