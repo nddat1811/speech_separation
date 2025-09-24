@@ -23,6 +23,16 @@ try:
 except Exception:
     HAS_FLASH_ATTN = False
 
+# Optional FlashAttention v1 import (Turing/T4 support)
+try:
+    from flash_attn import (
+        flash_attn_unpadded_func as flash_attn_v1_func,  # noqa: F401
+        flash_attn_unpadded_qkvpacked_func as flash_attn_v1_qkvpacked_func,  # noqa: F401
+    )
+    HAS_FLASH_ATTN_V1 = True
+except Exception:
+    HAS_FLASH_ATTN_V1 = False
+
 def identity(t, *args, **kwargs):
     return t
 
@@ -545,7 +555,7 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        if use_flash_attn and HAS_FLASH_ATTN:
+        if use_flash_attn and (HAS_FLASH_ATTN or HAS_FLASH_ATTN_V1):
             self.layers = nn.ModuleList([
                 FlashGroupedMHA(
                     dim = dim,
@@ -675,16 +685,39 @@ class FlashGroupedMHA(nn.Module):
         # reshape to groups and merge batch*groups
         qkv = rearrange(qkv, 'b (G t) three h d -> (b G) t three h d', t=g)
 
-        # run flash-attn per group (batched)
-        out = flash_attn_qkvpacked_func(
-            qkv,
-            dropout_p=(self.dropout_p if self.training else 0.0),
-            softmax_scale=None,
-            causal=self.causal,
-            window_size=(-1, -1),
-            alibi_slopes=None,
-            deterministic=False,
-        )
+        # Prefer FA v2 if available, else FA v1 (unpadded)
+        if HAS_FLASH_ATTN:
+            out = flash_attn_qkvpacked_func(
+                qkv,
+                dropout_p=(self.dropout_p if self.training else 0.0),
+                softmax_scale=None,
+                causal=self.causal,
+                window_size=(-1, -1),
+                alibi_slopes=None,
+                deterministic=False,
+            )
+        elif HAS_FLASH_ATTN_V1:
+            # v1 expects unpadded varlen with cu_seqlens; our groups have fixed t=g
+            # So we flatten batch*groups and build uniform cu_seqlens
+            BG, t, _, h, dhead = qkv.shape
+            device = qkv.device
+            # cu_seqlens: [0, g, 2g, ..., BG*g]
+            cu = torch.arange(0, (BG + 1) * g, g, device=device, dtype=torch.int32)
+            # reshape to [BG*g, 3, h, d]
+            qkv_flat = qkv.reshape(BG * g, 3, h, dhead)
+            out = flash_attn_v1_qkvpacked_func(
+                qkv_flat,
+                cu,
+                max_seqlen=g,
+                dropout_p=(self.dropout_p if self.training else 0.0),
+                softmax_scale=None,
+                causal=self.causal,
+                return_attn_probs=False,
+            )
+            out = out.view(BG, g, h, dhead)
+        else:
+            # Should not reach here since gating prevents construction when neither present
+            out = rearrange(qkv[..., 0, :, :], 'bg t h d -> bg t h d')
 
         # restore shape and remove padding
         out = rearrange(out, '(b G) t h d -> b (G t) (h d)', G=(n_padded // g))
