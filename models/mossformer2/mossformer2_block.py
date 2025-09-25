@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from torchinfo import summary
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding, apply_rotary_pos_emb
+from rotary_embedding_torch import RotaryEmbedding
 import os
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
@@ -216,19 +216,26 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.to_qk = nn.Linear(dim, query_key_dim, bias=False)
         self.to_hidden = nn.Linear(dim, hidden_dim * 2, bias=False)
         self.to_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.to_out = nn.Linear(hidden_dim * 2, dim, bias=False)
+        self.to_out = nn.Linear(hidden_dim * 2, dim, bias=False)  # Điều chỉnh nếu cần
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, *, mask=None):
+        """
+        b - batch
+        n - sequence length (within groups)
+        g - group dimension
+        d - feature dimension (keys)
+        e - feature dimension (values)
+        """
         b, seq, device, g = x.shape[0], x.shape[1], x.device, self.group_size
 
         # Pad sequence để chia hết cho group_size
-        padding = padding_to_multiple_of(seq, g)  # Hàm từ code gốc
+        padding = padding_to_multiple_of(seq, g)
         if padding > 0:
-            x = F.pad(x, (0, 0, 0, padding), value=0.)  # Pad ở chiều seq
+            x = F.pad(x, (0, 0, 0, padding), value=0.)
             seq = seq + padding
 
-        n = seq // g  # Bây giờ seq chia hết cho g
+        n = seq // g  # seq chia hết cho g
 
         # Norm
         x = self.norm(x)
@@ -251,8 +258,9 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
         # Rotary embeddings
         if exists(self.rotary_pos_emb):
-            freqs = self.rotary_pos_emb(q)
-            q, k = map(lambda t: apply_rotary_emb(freqs, t), (q, k))
+            # Dùng rotary_pos_emb trực tiếp để rotate queries và keys
+            q = self.rotary_pos_emb.rotate_queries_or_keys(q)  # Thay apply_rotary_pos_emb
+            k = self.rotary_pos_emb.rotate_queries_or_keys(k)
 
         # Shift one
         q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g h n d -> b g n (h d)'), (q, k))
@@ -278,7 +286,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
             if self.use_flash_attn:
                 q_flash = rearrange(q, 'b g h n d -> (b g) n h d', h=4)
                 k_flash = rearrange(k, 'b g h n d -> (b g) n h d', h=4)
-                v_flash = rearrange(hidden, 'b g n e -> (b g) n 1 e')  # Giả sử e=hidden_dim
+                v_flash = rearrange(hidden, 'b g n e -> (b g) n 1 e')
 
                 if HAS_FLASH_ATTN:
                     out = flash_attn_func(
@@ -325,7 +333,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         final_gate = F.silu(self.to_gate(x))
         out = out * final_gate
 
-        # Nếu padded, cắt bỏ padding
+        # Cắt padding nếu có
         if padding > 0:
             out = out[:, :seq - padding, :]
 
