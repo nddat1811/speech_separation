@@ -191,15 +191,15 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self,
         *,
         dim,
-        group_size = 256,
-        query_key_dim = 128,
-        expansion_factor = 1.,
-        causal = False,
-        dropout = 0.1,
-        rotary_pos_emb = None,
-        norm_klass = nn.LayerNorm,
-        shift_tokens = True,
-        use_flash_attn = True
+        group_size=256,
+        query_key_dim=128,
+        expansion_factor=1.,
+        causal=False,
+        dropout=0.1,
+        rotary_pos_emb=None,
+        norm_klass=nn.LayerNorm,
+        shift_tokens=True,
+        use_flash_attn=False
     ):
         super().__init__()
         hidden_dim = int(expansion_factor * dim)
@@ -207,179 +207,127 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.causal = causal
         self.shift_tokens = shift_tokens
         self.use_flash_attn = use_flash_attn and (HAS_FLASH_ATTN or HAS_FLASH_ATTN_V1)
-        self.head_dim = query_key_dim // 4  # Giả sử 4 heads from (p=2 h=2)
+        self.head_dim = query_key_dim // 4  # 4 heads (p=2, h=2)
 
         self.rotary_pos_emb = rotary_pos_emb
-
-        # positional embeddings
-
         self.qk_offset_scale = OffsetScale(query_key_dim, heads=4)
         self.shift_one_offset_scale = OffsetScale(query_key_dim, heads=2)
-
-        # norms
-
         self.norm = norm_klass(dim)
-
-        # to queries, keys
-
-        self.to_qk = nn.Linear(dim, query_key_dim, bias = False)
-
-        # to hidden, for parallel attention and feedforward (Lotus paper)
-
-        self.to_hidden = nn.Linear(dim, hidden_dim * 2, bias = False)
-
-        # to final gate values, that is also added to value and output of parallel feedforward
-
-        self.to_gate = nn.Linear(dim, hidden_dim, bias = False)
-
-        # to out, with final linear projection weighing
-
-        self.to_out = nn.Linear(hidden_dim * 2, dim, bias = False)
-
-        # dropout
-
+        self.to_qk = nn.Linear(dim, query_key_dim, bias=False)
+        self.to_hidden = nn.Linear(dim, hidden_dim * 2, bias=False)
+        self.to_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.to_out = nn.Linear(hidden_dim * 2, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, *, mask = None):
-        """
-        b - batch
-        n - sequence length (within groups)
-        g - group dimension
-        d - feature dimension (keys)
-        e - feature dimension (values)
-        i - sequence dimension (source)
-        j - sequence dimension (target)
-        """
-
+    def forward(self, x, *, mask=None):
         b, seq, device, g = x.shape[0], x.shape[1], x.device, self.group_size
 
-        n = seq // g  # seq must be multiple of group_size
+        # Pad sequence để chia hết cho group_size
+        padding = padding_to_multiple_of(seq, g)  # Hàm từ code gốc
+        if padding > 0:
+            x = F.pad(x, (0, 0, 0, padding), value=0.)  # Pad ở chiều seq
+            seq = seq + padding
 
-        # norm
+        n = seq // g  # Bây giờ seq chia hết cho g
 
+        # Norm
         x = self.norm(x)
 
-        # shift sequence with one token offset for keys and values
-
+        # Shift sequence
         if self.shift_tokens:
-            x_shift, x_pass = x.chunk(2, dim = -1)
-            x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
-            x = torch.cat((x_shift, x_pass), dim = -1)
+            x_shift, x_pass = x.chunk(2, dim=-1)
+            x_shift = F.pad(x_shift, (0, 0, 1, -1), value=0.)
+            x = torch.cat((x_shift, x_pass), dim=-1)
 
-        # to queries, keys
-
+        # Queries, keys
         qk = self.to_qk(x)
-
-        # offset and scale - tables 3-5 in paper
-
-        qk_offsets = self.qk_offset_scale(qk.mean(dim = -2).mean(dim = -2))
-
+        qk_offsets = self.qk_offset_scale(qk.mean(dim=-2).mean(dim=-2))
         q_offset, k_offset, q_scale, k_scale = qk_offsets
-
         q = (qk * q_scale) + q_offset
         k = (qk * k_scale) + k_offset
 
-        # split heads for queries and keys
+        # Split heads
+        q, k = map(lambda t: rearrange(t, 'b (g n) (h d) -> b g h n d', g=g, h=2, n=n, d=self.head_dim * 2), (q, k))
 
-        q, k = map(lambda t: rearrange(t, 'b (g n) (h d) -> b g h n d', g = g, h = 2, n = n, d = self.head_dim * 2), (q, k))  # Adjust d for h=2
-
-        # rotary embeddings
-
+        # Rotary embeddings
         if exists(self.rotary_pos_emb):
             freqs = self.rotary_pos_emb(q)
             q, k = map(lambda t: apply_rotary_emb(freqs, t), (q, k))
 
-        # shift one
-
+        # Shift one
         q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g h n d -> b g n (h d)'), (q, k))
+        q_shift_one, k_shift_one = map(lambda t: F.pad(t, (0, 0, 1, -1), value=0.), (q_shift_one, k_shift_one))
+        q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g n (h d) -> b g h n d', h=2), (q_shift_one, k_shift_one))
 
-        q_shift_one, k_shift_one = map(lambda t: F.pad(t, (0, 0, 1, -1), value = 0.), (q_shift_one, k_shift_one))
-
-        q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g n (h d) -> b g h n d', h = 2), (q_shift_one, k_shift_one))
-
-        shift_one_offsets = self.shift_one_offset_scale(einsum('b g d, h -> b g h d', qk.mean(dim = -2), torch.ones((2,), device = device)))
-
+        shift_one_offsets = self.shift_one_offset_scale(einsum('b g d, h -> b g h d', qk.mean(dim=-2), torch.ones((2,), device=device)))
         q_shift_one_offset, k_shift_one_offset = shift_one_offsets
-
         q_shift_one = (q_shift_one * q_scale) + q_shift_one_offset
         k_shift_one = (k_shift_one * k_scale) + k_shift_one_offset
 
-        # merge heads with shift one
+        # Merge heads
+        q = torch.stack((q, q_shift_one), dim=2)
+        k = torch.stack((k, k_shift_one), dim=2)
+        q, k = map(lambda t: rearrange(t, 'b g p h n d -> b g (p h) n d', p=2, h=2), (q, k))
 
-        q = torch.stack((q, q_shift_one), dim = 2)
-        k = torch.stack((k, k_shift_one), dim = 2)
-
-        q, k = map(lambda t: rearrange(t, 'b g p h n d -> b g (p h) n d', p = 2, h = 2), (q, k))
-
-        # to hidden states and gate
-
-        hidden, gate = self.to_hidden(x).chunk(2, dim = -1)
-
-        hidden = rearrange(hidden, 'b (g n) e -> b g n e', g = g, n = n)
-
-        # parallel attention and feedforward with shared linear projection
+        # Hidden states and gate
+        hidden, gate = self.to_hidden(x).chunk(2, dim=-1)
+        hidden = rearrange(hidden, 'b (g n) e -> b g n e', g=g, n=n)
 
         # Attention
-
-        with autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):  # Trigger Flash with bfloat16
-
+        with autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
             if self.use_flash_attn:
-                # Rearrange for Flash: q, k, v as (b*g, n, heads=4, head_dim)
-                q_flash = rearrange(q, 'b g h n d -> (b g) n h d', h=4)  # (b g) n 4 head_dim
+                q_flash = rearrange(q, 'b g h n d -> (b g) n h d', h=4)
                 k_flash = rearrange(k, 'b g h n d -> (b g) n h d', h=4)
-                v_flash = rearrange(hidden, 'b g n e -> (b g) n 1 e')  # v e = hidden_dim, but adjust if needed for heads; duplicate for heads if necessary
+                v_flash = rearrange(hidden, 'b g n e -> (b g) n 1 e')  # Giả sử e=hidden_dim
 
                 if HAS_FLASH_ATTN:
-                    out = flash_attn_func(q_flash, k_flash, v_flash, dropout_p = self.dropout.p if self.training else 0.0, causal = self.causal)
+                    out = flash_attn_func(
+                        q_flash, k_flash, v_flash,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        causal=self.causal
+                    )
                 elif HAS_FLASH_ATTN_V1:
-                    out = flash_attn_v1_func(q_flash, k_flash, v_flash, dropout_p = self.dropout.p if self.training else 0.0, causal = self.causal)
+                    out = flash_attn_v1_func(
+                        q_flash, k_flash, v_flash,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        causal=self.causal
+                    )
                 else:
-                    out = F.scaled_dot_product_attention(q_flash, k_flash, v_flash, attn_mask = mask, dropout_p = self.dropout.p if self.training else 0.0, is_causal = self.causal)
-
-                out = rearrange(out, '(b g) n h d -> b g h n d', g = g, h = 4)  # Back to original shape
-
+                    out = F.scaled_dot_product_attention(
+                        q_flash, k_flash, v_flash,
+                        attn_mask=mask,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        is_causal=self.causal
+                    )
+                out = rearrange(out, '(b g) n h d -> b g h n d', g=g, h=4)
             else:
-                # Old logic
                 sim = einsum('b g h i d, b g h j d -> b g h i j', q, k) * (self.head_dim ** -0.5)
-
                 i, j = sim.shape[-2], sim.shape[-1]
-
-                causal_mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-
+                causal_mask = torch.ones((i, j), dtype=torch.bool, device=device).triu(j - i + 1)
                 sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-
                 if exists(mask):
-                    mask = rearrange(mask, 'b (g n) -> b g n', g = g, n = n)
-                    mask = F.pad(mask, (1, 0), value = False)
+                    mask = rearrange(mask, 'b (g n) -> b g n', g=g, n=n)
+                    mask = F.pad(mask, (1, 0), value=False)
                     mask = rearrange(mask, 'b g n -> b g 1 1 n')
                     sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
-
-                attn = sim.softmax(dim = -1)
+                attn = sim.softmax(dim=-1)
                 attn = self.dropout(attn)
-
                 out = einsum('b g h i j, b g j e -> b g h i e', attn, hidden)
 
-        # final gate
-
-        gate = rearrange(gate, 'b (g n) e -> b g n e', g = g, n = n)
-
+        # Final gate
+        gate = rearrange(gate, 'b (g n) e -> b g n e', g=g, n=n)
         out = F.silu(out) * gate
+        out = rearrange(out, 'b g h n e -> b (g n) (h e)', h=4)
 
-        # merge heads
-
-        out = rearrange(out, 'b g h n e -> b (g n) (h e)', h = 4)
-
-        # combine with output of parallel feedforward
-
-        residual = torch.cat((hidden, out), dim = -1)
-
+        # Combine with parallel feedforward
+        residual = torch.cat((hidden, out), dim=-1)
         out = self.to_out(residual)
-
-        # final gate based on parallelism
-
         final_gate = F.silu(self.to_gate(x))
-
         out = out * final_gate
+
+        # Nếu padded, cắt bỏ padding
+        if padding > 0:
+            out = out[:, :seq - padding, :]
 
         return out + x
 
