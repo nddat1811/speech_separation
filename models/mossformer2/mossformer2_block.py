@@ -14,16 +14,6 @@ from rotary_embedding_torch import RotaryEmbedding
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
-
-try:
-    import flash_attn
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked  # tùy phiên bản / API
-    HAS_FLASH_ATTN = True
-    print("✓ Flash Attention v2 detected - using Flash Attention")
-    
-except Exception:
-    print("⚠️  Flash Attention not found. Installing Flash Attention v1 for T4 GPU...")
-    HAS_FLASH_ATTN = False
 # functions
 
 def identity(t, *args, **kwargs):
@@ -269,119 +259,70 @@ class FLASH_ShareA_FFConvM(nn.Module):
         x = x + self.to_out(out)
         return x
 
-    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
-        """
-        Multi-head version using PyTorch SDPA.
-        Works on PyTorch >=2.0 (you have 2.6 + CUDA 12.4).
-        Returns:
-            att_v, att_u  # (batch, seq_len, dim)
-        """
+    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
-        h = self.heads            # số heads (đã định nghĩa trong __init__)
-        d = self.query_key_dim     # dimension mỗi head (head_dim)
 
-        # --- linear part pre-mask ---
         if exists(mask):
             lin_mask = rearrange(mask, '... -> ... 1')
             lin_k = lin_k.masked_fill(~lin_mask, 0.)
 
-        # rotary embeddings
+        # rotate queries and keys
         if exists(self.rotary_pos_emb):
-            quad_q, lin_q, quad_k, lin_k = map(
-                self.rotary_pos_emb.rotate_queries_or_keys,
-                (quad_q, lin_q, quad_k, lin_k)
-            )
+            quad_q, lin_q, quad_k, lin_k = map(self.rotary_pos_emb.rotate_queries_or_keys, (quad_q, lin_q, quad_k, lin_k))
 
-        # --- pad to multiple of group_size ---
+        # padding for groups
         padding = padding_to_multiple_of(n, g)
+
         if padding > 0:
-            quad_q, quad_k, lin_q, lin_k, v, u = map(
-                lambda t: F.pad(t, (0, 0, 0, padding), value=0.0),
-                (quad_q, quad_k, lin_q, lin_k, v, u)
-            )
-            mask = default(mask, torch.ones((b, n), device=device, dtype=torch.bool))
-            mask = F.pad(mask, (0, padding), value=False)
+            quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: F.pad(t, (0, 0, 0, padding), value = 0.), (quad_q, quad_k, lin_q, lin_k, v, u))
 
-        # --- group reshape ---
-        quad_q, quad_k, lin_q, lin_k, v, u = map(
-            lambda t: rearrange(t, 'b (g n) (h d) -> b g n h d', n=self.group_size, h=h),
-            (quad_q, quad_k, lin_q, lin_k, v, u)
-        )
+            mask = default(mask, torch.ones((b, n), device = device, dtype = torch.bool))
+            mask = F.pad(mask, (0, padding), value = False)
+
+        # group along sequence
+        quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: rearrange(t, 'b (g n) d -> b g n d', n = self.group_size), (quad_q, quad_k, lin_q, lin_k, v, u))
 
         if exists(mask):
-            mask = rearrange(mask, 'b (g j) -> b g j', j=g)   # (b, g, n)
+            mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
 
-        # ============================================================
-        # Quadratic part via scaled_dot_product_attention
-        # ============================================================
-        B, G, N = quad_q.shape[0], quad_q.shape[1], quad_q.shape[2]
-        q = rearrange(quad_q, 'b g n h d -> (b g) h n d')
-        k = rearrange(quad_k, 'b g n h d -> (b g) h n d')
-        v_for_quad = rearrange(v, 'b g n h d -> (b g) h n d')
-        u_for_quad = rearrange(u, 'b g n h d -> (b g) h n d')
+        # calculate quadratic attention output
+        sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
 
-        attn_mask = None
+        attn = F.relu(sim) ** 2
+        attn = self.dropout(attn)
+
         if exists(mask):
-            # mask: (b, g, n) valid=True
-            mask_per_group = rearrange(mask, 'b g n -> (b g) n')      # (B_g, N)
-            masked_positions = ~mask_per_group                        # True=mask out
-            attn_mask = masked_positions[:, None, None, :].expand(-1, h, N, -1)  # (B_g, h, N, N)
+            attn = attn.masked_fill(~mask, 0.)
 
-        quad_out_v = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v_for_quad,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=self.causal
-        )   # (B_g, h, N, d)
-        quad_out_v = rearrange(quad_out_v, '(b g) h n d -> b g n (h d)', b=B, g=G)
-
-        quad_out_u = torch.nn.functional.scaled_dot_product_attention(
-            q, k, u_for_quad,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=self.causal
-        )
-        quad_out_u = rearrange(quad_out_u, '(b g) h n d -> b g n (h d)', b=B, g=G)
-
-        # ============================================================
-        # Linear attention part (giữ nguyên)
-        # ============================================================
         if self.causal:
-            lin_kv = einsum('b g n h d, b g n h e -> b g h d e', lin_k, v) / g
-            lin_kv = lin_kv.cumsum(dim=1)
-            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value=0.0)
-            lin_out_v = einsum('b g h d e, b g n h d -> b g n h e', lin_kv, lin_q)
+            causal_mask = torch.ones((g, g), dtype = torch.bool, device = device).triu(1)
+            attn = attn.masked_fill(causal_mask, 0.)
 
-            lin_ku = einsum('b g n h d, b g n h e -> b g h d e', lin_k, u) / g
-            lin_ku = lin_ku.cumsum(dim=1)
-            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value=0.0)
-            lin_out_u = einsum('b g h d e, b g n h d -> b g n h e', lin_ku, lin_q)
+        quad_out_v = einsum('... i j, ... j d -> ... i d', attn, v)
+        quad_out_u = einsum('... i j, ... j d -> ... i d', attn, u)
+
+        # calculate linear attention output
+        if self.causal:
+            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
+            # exclusive cumulative sum along group dimension
+            lin_kv = lin_kv.cumsum(dim = 1)
+            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value = 0.)
+            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
+
+            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
+            # exclusive cumulative sum along group dimension
+            lin_ku = lin_ku.cumsum(dim = 1)
+            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value = 0.)
+            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
         else:
-            lin_kv = einsum('b g n h d, b g n h e -> b h d e', lin_k, v) / n
-            lin_out_v = einsum('b g n h d, b h d e -> b g n h e', lin_q, lin_kv)
+            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
+            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
 
-            lin_ku = einsum('b g n h d, b g n h e -> b h d e', lin_k, u) / n
-            lin_out_u = einsum('b g n h d, b h d e -> b g n h e', lin_q, lin_ku)
+            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
+            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
 
-        lin_out_v = rearrange(lin_out_v, 'b g n h e -> b g n (h e)')
-        lin_out_u = rearrange(lin_out_u, 'b g n h e -> b g n (h e)')
-
-        # --- combine ---
-        att_v = quad_out_v + lin_out_v
-        att_u = quad_out_u + lin_out_u
-
-        # reshape back
-        att_v = rearrange(att_v, 'b g n d -> b (g n) d')
-        att_u = rearrange(att_u, 'b g n d -> b (g n) d')
-
-        # remove padding if added
-        if padding > 0:
-            att_v = att_v[:, :n, :]
-            att_u = att_u[:, :n, :]
-
-        return att_v, att_u
-
-
+        # fold back groups into full sequence, and excise out padding
+        return map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
 
 class Gated_FSMN(nn.Module):
     def __init__(
