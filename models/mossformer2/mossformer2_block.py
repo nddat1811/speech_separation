@@ -11,49 +11,18 @@ from torchinfo import summary
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
-# Import Flash Attention for T4 GPU
-FLASH_ATTN_AVAILABLE = False
-FLASH_ATTN_VERSION = "none"
-
-try:
-    from flash_attn import flash_attn_func
-    FLASH_ATTN_AVAILABLE = True
-    FLASH_ATTN_VERSION = "v2"
-    print("✓ Flash Attention v2 detected - using Flash Attention")
-except ImportError:
-    try:
-        # Try Flash Attention v1 (compatible with T4)
-        from flash_attn import flash_attn_func
-        FLASH_ATTN_AVAILABLE = True
-        FLASH_ATTN_VERSION = "v1"
-        print("✓ Flash Attention v1 detected - using Flash Attention")
-    except ImportError:
-        print("⚠️  Flash Attention not found. Installing Flash Attention v1 for T4 GPU...")
-        import subprocess
-        import sys
-        
-        try:
-            # Auto-install Flash Attention v1 for T4
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", 
-                "flash-attn==1.0.9", "--no-build-isolation", "--no-deps"
-            ])
-            print("✓ Flash Attention v1 installed successfully!")
-            
-            # Try importing again
-            from flash_attn import flash_attn_func
-            FLASH_ATTN_AVAILABLE = True
-            FLASH_ATTN_VERSION = "v1"
-            print("✓ Flash Attention v1 ready - using Flash Attention")
-            
-        except Exception as e:
-            print(f"❌ Failed to install Flash Attention: {e}")
-            print("✓ Falling back to memory-optimized attention for T4 GPU")
-            FLASH_ATTN_AVAILABLE = False
-
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
+
+try:
+    import flash_attn
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked  # tùy phiên bản / API
+    HAS_FLASH_ATTN = True
+    print("✓ Flash Attention v2 detected - using Flash Attention")
+    
+except Exception:
+    HAS_FLASH_ATTN = False
 # functions
 
 def identity(t, *args, **kwargs):
@@ -299,304 +268,110 @@ class FLASH_ShareA_FFConvM(nn.Module):
         x = x + self.to_out(out)
         return x
 
-    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
+    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
+        """
+        Attention calculation using PyTorch's scaled_dot_product_attention (SDPA).
+        Requires PyTorch >= 2.0 (you are on 2.6 + CUDA 12.4 so FlashAttention kernels are available).
+        Returns:
+            att_v, att_u  # (batch, seq_len, dim)
+        """
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
 
+        # --- linear attention pre-mask ---
         if exists(mask):
             lin_mask = rearrange(mask, '... -> ... 1')
             lin_k = lin_k.masked_fill(~lin_mask, 0.)
 
-        # rotate queries and keys
+        # rotary embeddings if enabled
         if exists(self.rotary_pos_emb):
-            quad_q, lin_q, quad_k, lin_k = map(self.rotary_pos_emb.rotate_queries_or_keys, (quad_q, lin_q, quad_k, lin_k))
+            quad_q, lin_q, quad_k, lin_k = map(
+                self.rotary_pos_emb.rotate_queries_or_keys,
+                (quad_q, lin_q, quad_k, lin_k)
+            )
 
-        # padding for groups
+        # --- pad to multiple of group_size ---
         padding = padding_to_multiple_of(n, g)
-
         if padding > 0:
-            quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: F.pad(t, (0, 0, 0, padding), value = 0.), (quad_q, quad_k, lin_q, lin_k, v, u))
-
-            mask = default(mask, torch.ones((b, n), device = device, dtype = torch.bool))
-            mask = F.pad(mask, (0, padding), value = False)
-
-        # group along sequence
-        quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: rearrange(t, 'b (g n) d -> b g n d', n = self.group_size), (quad_q, quad_k, lin_q, lin_k, v, u))
-
-        if exists(mask):
-            mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
-
-        # calculate quadratic attention output
-        sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
-
-        attn = F.relu(sim) ** 2
-        attn = self.dropout(attn)
-
-        if exists(mask):
-            attn = attn.masked_fill(~mask, 0.)
-
-        if self.causal:
-            causal_mask = torch.ones((g, g), dtype = torch.bool, device = device).triu(1)
-            attn = attn.masked_fill(causal_mask, 0.)
-
-        quad_out_v = einsum('... i j, ... j d -> ... i d', attn, v)
-        quad_out_u = einsum('... i j, ... j d -> ... i d', attn, u)
-
-        # calculate linear attention output
-        if self.causal:
-            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
-            # exclusive cumulative sum along group dimension
-            lin_kv = lin_kv.cumsum(dim = 1)
-            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value = 0.)
-            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
-
-            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
-            # exclusive cumulative sum along group dimension
-            lin_ku = lin_ku.cumsum(dim = 1)
-            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value = 0.)
-            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
-        else:
-            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
-            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
-
-            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
-            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
-
-        # fold back groups into full sequence, and excise out padding
-        return map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
-
-
-class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
-    """
-    Memory-optimized version of FLASH_ShareA_FFConvM for T4 GPU
-    Same architecture as original but with memory optimizations
-    """
-    def __init__(
-        self,
-        *,
-        dim,
-        group_size = 256,
-        query_key_dim = 128,
-        expansion_factor = 1.,
-        causal = False,
-        dropout = 0.1,
-        rotary_pos_emb = None,
-        norm_klass = nn.LayerNorm,
-        shift_tokens = True,
-        num_heads = 8,
-        use_flash_attn = True,
-        chunk_size = 512  # Smaller chunks for T4
-    ):
-        super().__init__()
-        hidden_dim = int(dim * expansion_factor)        
-        self.group_size = group_size
-        self.causal = causal
-        self.shift_tokens = shift_tokens
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.chunk_size = chunk_size
-        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
-
-        # positional embeddings
-        self.rotary_pos_emb = rotary_pos_emb
-        # norm
-        self.dropout = nn.Dropout(dropout)
-        
-        # Same projections as original
-        self.to_hidden = FFConvM(
-            dim_in = dim,
-            dim_out = hidden_dim,
-            norm_klass = norm_klass,
-            dropout = dropout,
+            quad_q, quad_k, lin_q, lin_k, v, u = map(
+                lambda t: F.pad(t, (0, 0, 0, padding), value=0.0),
+                (quad_q, quad_k, lin_q, lin_k, v, u)
             )
-        self.to_qk = FFConvM(
-            dim_in = dim,
-            dim_out = query_key_dim,
-            norm_klass = norm_klass,
-            dropout = dropout,
-            )
+            mask = default(mask, torch.ones((b, n), device=device, dtype=torch.bool))
+            mask = F.pad(mask, (0, padding), value=False)
 
-        self.qk_offset_scale = OffsetScale(query_key_dim, heads = 4)
-
-        self.to_out = FFConvM(
-            dim_in = dim*2,
-            dim_out = dim,
-            norm_klass = norm_klass,
-            dropout = dropout,
-            )
-        
-        self.gateActivate = nn.Sigmoid() 
-
-    def forward(
-        self,
-        x,
-        *,
-        mask = None
-    ):
-        """
-        Memory-optimized forward pass for T4 GPU
-        Same logic as original but with memory optimizations
-        """
-
-        # prenorm
-        normed_x = x
-
-        # do token shift - a great, costless trick from an independent AI researcher in Shenzhen
-        residual = x
-
-        if self.shift_tokens:
-            x_shift, x_pass = normed_x.chunk(2, dim = -1)
-            x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
-            normed_x = torch.cat((x_shift, x_pass), dim = -1)
-
-        # initial projections
-        v, u = self.to_hidden(normed_x).chunk(2, dim = -1)
-        qk = self.to_qk(normed_x)
-
-        # offset and scale
-        quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
-        
-        # Use memory-optimized attention
-        att_v, att_u = self.cal_attention_optimized(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
-
-        out = (att_u*v ) * self.gateActivate(att_v*u)
-        x = x + self.to_out(out)
-        return x
-
-    def cal_attention_optimized(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
-        """
-        Flash Attention optimized for T4 GPU
-        Uses Flash Attention when available, falls back to memory-optimized attention
-        """
-        b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
-
-        # Try Flash Attention first if available
-        if FLASH_ATTN_AVAILABLE and n > 64:  # Use Flash Attention for longer sequences
-            try:
-                return self.cal_attention_flash_attn(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
-            except Exception as e:
-                print(f"⚠️  Flash Attention failed, using fallback: {e}")
-                # Fall through to memory-optimized attention
-
-        # Memory-optimized fallback attention
-        if exists(mask):
-            lin_mask = rearrange(mask, '... -> ... 1')
-            lin_k = lin_k.masked_fill(~lin_mask, 0.)
-
-        # rotate queries and keys
-        if exists(self.rotary_pos_emb):
-            quad_q, lin_q, quad_k, lin_k = map(self.rotary_pos_emb.rotate_queries_or_keys, (quad_q, lin_q, quad_k, lin_k))
-
-        # padding for groups
-        padding = padding_to_multiple_of(n, g)
-
-        if padding > 0:
-            quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: F.pad(t, (0, 0, 0, padding), value = 0.), (quad_q, quad_k, lin_q, lin_k, v, u))
-
-            mask = default(mask, torch.ones((b, n), device = device, dtype = torch.bool))
-            mask = F.pad(mask, (0, padding), value = False)
-
-        # group along sequence
-        quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: rearrange(t, 'b (g n) d -> b g n d', n = self.group_size), (quad_q, quad_k, lin_q, lin_k, v, u))
-
-        if exists(mask):
-            mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
-
-        # calculate quadratic attention output with memory optimization
-        sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
-
-        attn = F.relu(sim) ** 2
-        attn = self.dropout(attn)
-
-        if exists(mask):
-            attn = attn.masked_fill(~mask, 0.)
-
-        if self.causal:
-            causal_mask = torch.ones((g, g), dtype = torch.bool, device = device).triu(1)
-            attn = attn.masked_fill(causal_mask, 0.)
-
-        # Memory-optimized computation
-        quad_out_v = einsum('... i j, ... j d -> ... i d', attn, v)
-        quad_out_u = einsum('... i j, ... j d -> ... i d', attn, u)
-
-        # calculate linear attention output with memory optimization
-        if self.causal:
-            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
-            # exclusive cumulative sum along group dimension
-            lin_kv = lin_kv.cumsum(dim = 1)
-            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value = 0.)
-            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
-
-            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
-            # exclusive cumulative sum along group dimension
-            lin_ku = lin_ku.cumsum(dim = 1)
-            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value = 0.)
-            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
-        else:
-            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
-            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
-
-            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
-            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
-
-        # fold back groups into full sequence, and excise out padding
-        # Memory optimization: clear intermediate tensors
-        result = map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
-        
-        # Clear memory
-        del quad_out_v, quad_out_u, lin_out_v, lin_out_u
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        return result
-
-    def cal_attention_flash_attn(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
-        """
-        Flash Attention implementation for T4 GPU
-        """
-        b, n, device = x.shape[0], x.shape[-2], x.device
-        
-        # Prepare Q, K, V for Flash Attention using existing projections
-        # Use to_qk for Q and K, to_hidden for V
-        qk = self.to_qk(x)  # [b, n, query_key_dim]
-        hidden = self.to_hidden(x)  # [b, n, hidden_dim]
-        
-        # Split qk into Q and K
-        qk_dim = qk.shape[-1]
-        q = qk[..., :qk_dim//2]  # [b, n, qk_dim//2]
-        k = qk[..., qk_dim//2:]  # [b, n, qk_dim//2]
-        
-        # Use v from hidden projection
-        v_hidden = hidden[..., :qk_dim//2]  # [b, n, qk_dim//2]
-        
-        # Reshape for multi-head attention
-        head_dim = qk_dim // 2 // self.num_heads
-        q = q.view(b, n, self.num_heads, head_dim)
-        k = k.view(b, n, self.num_heads, head_dim)
-        v = v_hidden.view(b, n, self.num_heads, head_dim)
-        
-        # Apply rotary position embeddings if available
-        if exists(self.rotary_pos_emb):
-            q = self.rotary_pos_emb.rotate_queries_or_keys(q)
-            k = self.rotary_pos_emb.rotate_queries_or_keys(k)
-        
-        # Use Flash Attention
-        attn_out = flash_attn_func(
-            q, k, v,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            causal=self.causal,
-            softmax_scale=1.0 / math.sqrt(head_dim)
+        # --- group reshape ---
+        quad_q, quad_k, lin_q, lin_k, v, u = map(
+            lambda t: rearrange(t, 'b (g n) d -> b g n d', n=self.group_size),
+            (quad_q, quad_k, lin_q, lin_k, v, u)
         )
-        
-        # Reshape back to original format
-        attn_out = attn_out.view(b, n, -1)
-        
-        # Apply the same gating mechanism as original
-        att_v = attn_out
-        att_u = attn_out
-        
+
+        if exists(mask):
+            mask = rearrange(mask, 'b (g j) -> b g 1 j', j=g)
+
+        # ============================================================
+        # Quadratic part using scaled_dot_product_attention (FlashAttention inside PyTorch)
+        # ============================================================
+        B, G = quad_q.shape[0], quad_q.shape[1]
+        q = rearrange(quad_q, 'b g n d -> (b g) n d')
+        k = rearrange(quad_k, 'b g n d -> (b g) n d')
+        v_for_quad = rearrange(v, 'b g n d -> (b g) n d')
+        u_for_quad = rearrange(u, 'b g n d -> (b g) n d')
+
+        # attn mask for SDPA: shape (B*G, 1, N, N)
+        attn_mask = None
+        if exists(mask):
+            attn_mask = rearrange(mask, 'b g 1 j -> (b g) 1 1 j')
+
+        quad_out_v = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v_for_quad,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=self.causal
+        )
+        quad_out_v = rearrange(quad_out_v, '(b g) n d -> b g n d', b=B, g=G)
+
+        quad_out_u = torch.nn.functional.scaled_dot_product_attention(
+            q, k, u_for_quad,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=self.causal
+        )
+        quad_out_u = rearrange(quad_out_u, '(b g) n d -> b g n d', b=B, g=G)
+
+        # ============================================================
+        # Linear attention part (giữ nguyên như code gốc)
+        # ============================================================
+        if self.causal:
+            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
+            lin_kv = lin_kv.cumsum(dim=1)
+            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value=0.0)
+            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
+
+            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
+            lin_ku = lin_ku.cumsum(dim=1)
+            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value=0.0)
+            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
+        else:
+            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
+            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
+
+            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
+            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
+
+        # --- combine ---
+        att_v = quad_out_v + lin_out_v
+        att_u = quad_out_u + lin_out_u
+
+        # reshape back
+        att_v = rearrange(att_v, 'b g n d -> b (g n) d')
+        att_u = rearrange(att_u, 'b g n d -> b (g n) d')
+
+        # remove padding if added
+        if padding > 0:
+            att_v = att_v[:, :n, :]
+            att_u = att_u[:, :n, :]
+
         return att_v, att_u
-
-
 
 class Gated_FSMN(nn.Module):
     def __init__(
@@ -763,23 +538,7 @@ class MossformerBlock_GFSMN(nn.Module):
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        
-        # Use optimized attention for T4 GPU
-        print("✓ Initializing memory-efficient attention for T4 GPU")
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
-            dim = dim, 
-            group_size = group_size, 
-            query_key_dim = query_key_dim, 
-            expansion_factor = expansion_factor, 
-            causal = causal, 
-            dropout = attn_dropout, 
-            rotary_pos_emb = rotary_pos_emb, 
-            norm_klass = norm_klass, 
-            shift_tokens = shift_tokens,
-            num_heads = 8,
-            use_flash_attn = FLASH_ATTN_AVAILABLE,
-            chunk_size = 256  # Smaller chunks for T4
-        ) for _ in range(depth)])
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -827,23 +586,7 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        
-        # Use optimized attention for T4 GPU
-        print("✓ Initializing memory-efficient attention for T4 GPU")
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
-            dim = dim, 
-            group_size = group_size, 
-            query_key_dim = query_key_dim, 
-            expansion_factor = expansion_factor, 
-            causal = causal, 
-            dropout = attn_dropout, 
-            rotary_pos_emb = rotary_pos_emb, 
-            norm_klass = norm_klass, 
-            shift_tokens = shift_tokens,
-            num_heads = 8,
-            use_flash_attn = FLASH_ATTN_AVAILABLE,
-            chunk_size = 256  # Smaller chunks for T4
-        ) for _ in range(depth)])
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
