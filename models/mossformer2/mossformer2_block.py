@@ -303,24 +303,20 @@ class FLASH_ShareA_FFConvM(nn.Module):
         """Flash Attention implementation for MossFormer2"""
         b, n, device = x.shape[0], x.shape[-2], x.device
         
-        # Prepare Q, K, V for Flash Attention
-        # Combine quad and lin queries/keys for Flash Attention
-        q_combined = torch.cat([quad_q, lin_q], dim=-1)  # [b, n, query_key_dim*2]
-        k_combined = torch.cat([quad_k, lin_k], dim=-1)  # [b, n, query_key_dim*2]
-        
+        # Use quad_q and quad_k for Flash Attention (simpler approach)
         # Reshape for multi-head attention
         head_dim = self.head_dim
-        q_combined = q_combined.view(b, n, self.num_heads, head_dim)
-        k_combined = k_combined.view(b, n, self.num_heads, head_dim)
-        v = v.view(b, n, self.num_heads, head_dim)
-        u = u.view(b, n, self.num_heads, head_dim)
+        q_flash = quad_q.view(b, n, self.num_heads, head_dim)
+        k_flash = quad_k.view(b, n, self.num_heads, head_dim)
+        v_flash = v.view(b, n, self.num_heads, head_dim)
+        u_flash = u.view(b, n, self.num_heads, head_dim)
         
         # Apply Flash Attention
         softmax_scale = 1.0 / math.sqrt(head_dim)
         
         # Flash attention for v
         attn_out_v = flash_attn_func(
-            q_combined, k_combined, v,
+            q_flash, k_flash, v_flash,
             dropout_p=self.dropout.p if self.training else 0.0,
             softmax_scale=softmax_scale,
             causal=self.causal
@@ -328,7 +324,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         
         # Flash attention for u
         attn_out_u = flash_attn_func(
-            q_combined, k_combined, u,
+            q_flash, k_flash, u_flash,
             dropout_p=self.dropout.p if self.training else 0.0,
             softmax_scale=softmax_scale,
             causal=self.causal
