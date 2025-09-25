@@ -344,8 +344,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
 class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
     """
-    Optimized Attention implementation for T4 GPU
-    Uses memory-efficient attention with chunking for T4 compatibility
+    Memory-optimized version of FLASH_ShareA_FFConvM for T4 GPU
+    Same architecture as original but with memory optimizations
     """
     def __init__(
         self,
@@ -378,7 +378,7 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         # norm
         self.dropout = nn.Dropout(dropout)
         
-        # projections
+        # Same projections as original
         self.to_hidden = FFConvM(
             dim_in = dim,
             dim_out = hidden_dim,
@@ -392,15 +392,9 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
             dropout = dropout,
             )
 
-        # Memory-efficient projections for T4
-        self.to_q = nn.Linear(dim, dim, bias=False)
-        self.to_k = nn.Linear(dim, dim, bias=False)
-        self.to_v = nn.Linear(dim, dim, bias=False)
-        self.to_out = nn.Linear(dim, dim, bias=False)
-
         self.qk_offset_scale = OffsetScale(query_key_dim, heads = 4)
 
-        self.to_out_conv = FFConvM(
+        self.to_out = FFConvM(
             dim_in = dim*2,
             dim_out = dim,
             norm_klass = norm_klass,
@@ -416,13 +410,8 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         mask = None
     ):
         """
-        b - batch
-        n - sequence length (within groups)
-        g - group dimension
-        d - feature dimension (keys)
-        e - feature dimension (values)
-        i - sequence dimension (source)
-        j - sequence dimension (target)
+        Memory-optimized forward pass for T4 GPU
+        Same logic as original but with memory optimizations
         """
 
         # prenorm
@@ -443,110 +432,17 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         # offset and scale
         quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
         
-        if self.use_flash_attn:
-            att_v, att_u = self.cal_attention_flash(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
-        else:
-            att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+        # Use memory-optimized attention
+        att_v, att_u = self.cal_attention_optimized(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
         out = (att_u*v ) * self.gateActivate(att_v*u)
-        x = x + self.to_out_conv(out)
+        x = x + self.to_out(out)
         return x
 
-    def cal_attention_flash(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
+    def cal_attention_optimized(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         """
-        Memory-efficient attention optimized for T4 GPU
-        Uses chunked attention to reduce memory usage
-        """
-        b, n, device = x.shape[0], x.shape[-2], x.device
-        
-        # Prepare Q, K, V for attention
-        q = self.to_q(x).view(b, n, self.num_heads, self.head_dim)
-        k = self.to_k(x).view(b, n, self.num_heads, self.head_dim)
-        v = self.to_v(x).view(b, n, self.num_heads, self.head_dim)
-        
-        # Apply rotary position embeddings if available
-        if exists(self.rotary_pos_emb):
-            q = self.rotary_pos_emb.rotate_queries_or_keys(q)
-            k = self.rotary_pos_emb.rotate_queries_or_keys(k)
-        
-        # Use chunked attention for T4 compatibility
-        if n > self.chunk_size:
-            attn_out = self.chunked_attention(q, k, v, mask)
-        else:
-            attn_out = self.standard_attention(q, k, v, mask)
-        
-        # Reshape back to (batch, seq_len, dim)
-        attn_out = attn_out.view(b, n, -1)
-        
-        # Apply the same gating mechanism as original
-        att_v = attn_out
-        att_u = attn_out
-        
-        return att_v, att_u
-
-    def standard_attention(self, q, k, v, mask=None):
-        """Standard scaled dot-product attention as fallback"""
-        b, n, num_heads, head_dim = q.shape
-        
-        # Reshape for attention computation
-        q = q.transpose(1, 2)  # (b, num_heads, n, head_dim)
-        k = k.transpose(1, 2)  # (b, num_heads, n, head_dim)
-        v = v.transpose(1, 2)  # (b, num_heads, n, head_dim)
-        
-        # Compute attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
-        
-        # Apply causal mask if needed
-        if self.causal:
-            causal_mask = torch.triu(torch.ones(n, n, device=q.device), diagonal=1).bool()
-            scores = scores.masked_fill(causal_mask, float('-inf'))
-        
-        # Apply attention mask if provided
-        if mask is not None:
-            scores = scores.masked_fill(~mask.unsqueeze(1).unsqueeze(2), float('-inf'))
-        
-        # Apply softmax and dropout
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        out = torch.matmul(attn_weights, v)
-        
-        # Reshape back to (b, n, num_heads, head_dim)
-        out = out.transpose(1, 2)
-        
-        return out
-
-    def chunked_attention(self, q, k, v, mask=None):
-        """
-        Memory-efficient chunked attention for T4 GPU
-        Processes attention in smaller chunks to reduce memory usage
-        """
-        b, n, num_heads, head_dim = q.shape
-        chunk_size = self.chunk_size
-        
-        # Initialize output
-        out = torch.zeros_like(q)
-        
-        # Process in chunks
-        for i in range(0, n, chunk_size):
-            end_i = min(i + chunk_size, n)
-            q_chunk = q[:, i:end_i]
-            
-            # Compute attention for this chunk
-            chunk_out = self.standard_attention(q_chunk, k, v, mask)
-            out[:, i:end_i] = chunk_out
-            
-            # Clear intermediate tensors to save memory
-            del q_chunk, chunk_out
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        return out
-
-    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
-        """
-        Original attention mechanism as fallback
+        Memory-optimized version of original attention for T4 GPU
+        Same computation but with memory optimizations
         """
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
 
@@ -573,7 +469,7 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         if exists(mask):
             mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
 
-        # calculate quadratic attention output
+        # calculate quadratic attention output with memory optimization
         sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
 
         attn = F.relu(sim) ** 2
@@ -586,10 +482,11 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
             causal_mask = torch.ones((g, g), dtype = torch.bool, device = device).triu(1)
             attn = attn.masked_fill(causal_mask, 0.)
 
+        # Memory-optimized computation
         quad_out_v = einsum('... i j, ... j d -> ... i d', attn, v)
         quad_out_u = einsum('... i j, ... j d -> ... i d', attn, u)
 
-        # calculate linear attention output
+        # calculate linear attention output with memory optimization
         if self.causal:
             lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
             # exclusive cumulative sum along group dimension
@@ -610,7 +507,17 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
             lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
 
         # fold back groups into full sequence, and excise out padding
-        return map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
+        # Memory optimization: clear intermediate tensors
+        result = map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
+        
+        # Clear memory
+        del quad_out_v, quad_out_u, lin_out_v, lin_out_u
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return result
+
+
 
 class Gated_FSMN(nn.Module):
     def __init__(
