@@ -11,6 +11,14 @@ from torchinfo import summary
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
+# Import Flash Attention
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    print("Warning: Flash Attention not available. Using standard attention.")
+
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
@@ -324,6 +332,255 @@ class FLASH_ShareA_FFConvM(nn.Module):
         # fold back groups into full sequence, and excise out padding
         return map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
 
+
+class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
+    """
+    FLASH Attention implementation using Dao-AILab's Flash Attention
+    This replaces the custom attention mechanism with optimized Flash Attention
+    """
+    def __init__(
+        self,
+        *,
+        dim,
+        group_size = 256,
+        query_key_dim = 128,
+        expansion_factor = 1.,
+        causal = False,
+        dropout = 0.1,
+        rotary_pos_emb = None,
+        norm_klass = nn.LayerNorm,
+        shift_tokens = True,
+        num_heads = 8,
+        use_flash_attn = True
+    ):
+        super().__init__()
+        hidden_dim = int(dim * expansion_factor)        
+        self.group_size = group_size
+        self.causal = causal
+        self.shift_tokens = shift_tokens
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
+
+        # positional embeddings
+        self.rotary_pos_emb = rotary_pos_emb
+        # norm
+        self.dropout = nn.Dropout(dropout)
+        
+        # projections
+        self.to_hidden = FFConvM(
+            dim_in = dim,
+            dim_out = hidden_dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
+        self.to_qk = FFConvM(
+            dim_in = dim,
+            dim_out = query_key_dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
+
+        # Flash Attention compatible projections
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.to_out = nn.Linear(dim, dim, bias=False)
+
+        self.qk_offset_scale = OffsetScale(query_key_dim, heads = 4)
+
+        self.to_out_conv = FFConvM(
+            dim_in = dim*2,
+            dim_out = dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
+        
+        self.gateActivate = nn.Sigmoid() 
+
+    def forward(
+        self,
+        x,
+        *,
+        mask = None
+    ):
+        """
+        b - batch
+        n - sequence length (within groups)
+        g - group dimension
+        d - feature dimension (keys)
+        e - feature dimension (values)
+        i - sequence dimension (source)
+        j - sequence dimension (target)
+        """
+
+        # prenorm
+        normed_x = x
+
+        # do token shift - a great, costless trick from an independent AI researcher in Shenzhen
+        residual = x
+
+        if self.shift_tokens:
+            x_shift, x_pass = normed_x.chunk(2, dim = -1)
+            x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+            normed_x = torch.cat((x_shift, x_pass), dim = -1)
+
+        # initial projections
+        v, u = self.to_hidden(normed_x).chunk(2, dim = -1)
+        qk = self.to_qk(normed_x)
+
+        # offset and scale
+        quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
+        
+        if self.use_flash_attn:
+            att_v, att_u = self.cal_attention_flash(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+        else:
+            att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+
+        out = (att_u*v ) * self.gateActivate(att_v*u)
+        x = x + self.to_out_conv(out)
+        return x
+
+    def cal_attention_flash(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
+        """
+        Flash Attention implementation using Dao-AILab's flash_attn_func
+        """
+        b, n, device = x.shape[0], x.shape[-2], x.device
+        
+        # Prepare Q, K, V for Flash Attention
+        # Reshape to (batch, seq_len, num_heads, head_dim)
+        q = self.to_q(x).view(b, n, self.num_heads, self.head_dim)
+        k = self.to_k(x).view(b, n, self.num_heads, self.head_dim)
+        v = self.to_v(x).view(b, n, self.num_heads, self.head_dim)
+        
+        # Apply rotary position embeddings if available
+        if exists(self.rotary_pos_emb):
+            q = self.rotary_pos_emb.rotate_queries_or_keys(q)
+            k = self.rotary_pos_emb.rotate_queries_or_keys(k)
+        
+        # Use Flash Attention
+        if self.use_flash_attn:
+            # Flash Attention expects (batch, seq_len, num_heads, head_dim)
+            attn_out = flash_attn_func(
+                q, k, v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                causal=self.causal,
+                softmax_scale=1.0 / math.sqrt(self.head_dim)
+            )
+        else:
+            # Fallback to standard attention
+            attn_out = self.standard_attention(q, k, v, mask)
+        
+        # Reshape back to (batch, seq_len, dim)
+        attn_out = attn_out.view(b, n, -1)
+        
+        # Apply the same gating mechanism as original
+        att_v = attn_out
+        att_u = attn_out
+        
+        return att_v, att_u
+
+    def standard_attention(self, q, k, v, mask=None):
+        """Standard scaled dot-product attention as fallback"""
+        b, n, num_heads, head_dim = q.shape
+        
+        # Reshape for attention computation
+        q = q.transpose(1, 2)  # (b, num_heads, n, head_dim)
+        k = k.transpose(1, 2)  # (b, num_heads, n, head_dim)
+        v = v.transpose(1, 2)  # (b, num_heads, n, head_dim)
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        
+        # Apply causal mask if needed
+        if self.causal:
+            causal_mask = torch.triu(torch.ones(n, n, device=q.device), diagonal=1).bool()
+            scores = scores.masked_fill(causal_mask, float('-inf'))
+        
+        # Apply attention mask if provided
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+        
+        # Apply softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        out = torch.matmul(attn_weights, v)
+        
+        # Reshape back to (b, n, num_heads, head_dim)
+        out = out.transpose(1, 2)
+        
+        return out
+
+    def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
+        """
+        Original attention mechanism as fallback
+        """
+        b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
+
+        if exists(mask):
+            lin_mask = rearrange(mask, '... -> ... 1')
+            lin_k = lin_k.masked_fill(~lin_mask, 0.)
+
+        # rotate queries and keys
+        if exists(self.rotary_pos_emb):
+            quad_q, lin_q, quad_k, lin_k = map(self.rotary_pos_emb.rotate_queries_or_keys, (quad_q, lin_q, quad_k, lin_k))
+
+        # padding for groups
+        padding = padding_to_multiple_of(n, g)
+
+        if padding > 0:
+            quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: F.pad(t, (0, 0, 0, padding), value = 0.), (quad_q, quad_k, lin_q, lin_k, v, u))
+
+            mask = default(mask, torch.ones((b, n), device = device, dtype = torch.bool))
+            mask = F.pad(mask, (0, padding), value = False)
+
+        # group along sequence
+        quad_q, quad_k, lin_q, lin_k, v, u = map(lambda t: rearrange(t, 'b (g n) d -> b g n d', n = self.group_size), (quad_q, quad_k, lin_q, lin_k, v, u))
+
+        if exists(mask):
+            mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
+
+        # calculate quadratic attention output
+        sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
+
+        attn = F.relu(sim) ** 2
+        attn = self.dropout(attn)
+
+        if exists(mask):
+            attn = attn.masked_fill(~mask, 0.)
+
+        if self.causal:
+            causal_mask = torch.ones((g, g), dtype = torch.bool, device = device).triu(1)
+            attn = attn.masked_fill(causal_mask, 0.)
+
+        quad_out_v = einsum('... i j, ... j d -> ... i d', attn, v)
+        quad_out_u = einsum('... i j, ... j d -> ... i d', attn, u)
+
+        # calculate linear attention output
+        if self.causal:
+            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
+            # exclusive cumulative sum along group dimension
+            lin_kv = lin_kv.cumsum(dim = 1)
+            lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value = 0.)
+            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
+
+            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
+            # exclusive cumulative sum along group dimension
+            lin_ku = lin_ku.cumsum(dim = 1)
+            lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value = 0.)
+            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
+        else:
+            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
+            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
+
+            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
+            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
+
+        # fold back groups into full sequence, and excise out padding
+        return map(lambda t: rearrange(t, 'b g n d -> b (g n) d')[:, :n], (quad_out_v+lin_out_v, quad_out_u+lin_out_u))
+
 class Gated_FSMN(nn.Module):
     def __init__(
         self,
@@ -489,7 +746,36 @@ class MossformerBlock_GFSMN(nn.Module):
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        
+        # Use Flash Attention if available, otherwise fallback to original
+        if FLASH_ATTN_AVAILABLE:
+            print("Using Flash Attention for GFSMN")
+            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
+                dim = dim, 
+                group_size = group_size, 
+                query_key_dim = query_key_dim, 
+                expansion_factor = expansion_factor, 
+                causal = causal, 
+                dropout = attn_dropout, 
+                rotary_pos_emb = rotary_pos_emb, 
+                norm_klass = norm_klass, 
+                shift_tokens = shift_tokens,
+                num_heads = 8,
+                use_flash_attn = True
+            ) for _ in range(depth)])
+        else:
+            print("Using standard attention for GFSMN")
+            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(
+                dim = dim, 
+                group_size = group_size, 
+                query_key_dim = query_key_dim, 
+                expansion_factor = expansion_factor, 
+                causal = causal, 
+                dropout = attn_dropout, 
+                rotary_pos_emb = rotary_pos_emb, 
+                norm_klass = norm_klass, 
+                shift_tokens = shift_tokens
+            ) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -537,7 +823,36 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        
+        # Use Flash Attention if available, otherwise fallback to original
+        if FLASH_ATTN_AVAILABLE:
+            print("Using Flash Attention for MossformerBlock")
+            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
+                dim = dim, 
+                group_size = group_size, 
+                query_key_dim = query_key_dim, 
+                expansion_factor = expansion_factor, 
+                causal = causal, 
+                dropout = attn_dropout, 
+                rotary_pos_emb = rotary_pos_emb, 
+                norm_klass = norm_klass, 
+                shift_tokens = shift_tokens,
+                num_heads = 8,
+                use_flash_attn = True
+            ) for _ in range(depth)])
+        else:
+            print("Using standard attention for MossformerBlock")
+            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(
+                dim = dim, 
+                group_size = group_size, 
+                query_key_dim = query_key_dim, 
+                expansion_factor = expansion_factor, 
+                causal = causal, 
+                dropout = attn_dropout, 
+                rotary_pos_emb = rotary_pos_emb, 
+                norm_klass = norm_klass, 
+                shift_tokens = shift_tokens
+            ) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
