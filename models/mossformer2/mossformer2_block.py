@@ -22,6 +22,7 @@ try:
     print("✓ Flash Attention v2 detected - using Flash Attention")
     
 except Exception:
+    print("⚠️  Flash Attention not found. Installing Flash Attention v1 for T4 GPU...")
     HAS_FLASH_ATTN = False
 # functions
 
