@@ -320,7 +320,7 @@ class MossFormerM(nn.Module):
         super().__init__()
         # If requested, use the FlashAttention-backed MossformerBlock; else GFSMN variant
         if use_flash_attn:
-            self.mossformerM = MossformerBlock(
+            self.mossformerM = MossformerBlock_GFSMN(
                                dim=d_model,
                                depth=num_blocks,
                                group_size=group_size,
