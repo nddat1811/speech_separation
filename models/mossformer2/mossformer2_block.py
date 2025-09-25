@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from torchinfo import summary
 from einops import rearrange
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_pos_emb
 import os
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
