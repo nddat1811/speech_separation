@@ -11,13 +11,22 @@ from torchinfo import summary
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
-# Import Flash Attention
+# Import Flash Attention v1 (compatible with T4)
 try:
     from flash_attn import flash_attn_func
     FLASH_ATTN_AVAILABLE = True
+    print("Flash Attention v2 available")
 except ImportError:
-    FLASH_ATTN_AVAILABLE = False
-    print("Warning: Flash Attention not available. Using standard attention.")
+    try:
+        # Try Flash Attention v1
+        import flash_attn_1_cuda as flash_attn_gpu
+        FLASH_ATTN_AVAILABLE = True
+        FLASH_ATTN_VERSION = "v1"
+        print("Flash Attention v1 available")
+    except ImportError:
+        FLASH_ATTN_AVAILABLE = False
+        FLASH_ATTN_VERSION = "none"
+        print("Warning: Flash Attention not available. Using optimized standard attention for T4.")
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
@@ -335,8 +344,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
 class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
     """
-    FLASH Attention implementation using Dao-AILab's Flash Attention
-    This replaces the custom attention mechanism with optimized Flash Attention
+    Optimized Attention implementation for T4 GPU
+    Uses memory-efficient attention with chunking for T4 compatibility
     """
     def __init__(
         self,
@@ -351,7 +360,8 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         norm_klass = nn.LayerNorm,
         shift_tokens = True,
         num_heads = 8,
-        use_flash_attn = True
+        use_flash_attn = True,
+        chunk_size = 512  # Smaller chunks for T4
     ):
         super().__init__()
         hidden_dim = int(dim * expansion_factor)        
@@ -360,6 +370,7 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         self.shift_tokens = shift_tokens
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.chunk_size = chunk_size
         self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
 
         # positional embeddings
@@ -381,7 +392,7 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
             dropout = dropout,
             )
 
-        # Flash Attention compatible projections
+        # Memory-efficient projections for T4
         self.to_q = nn.Linear(dim, dim, bias=False)
         self.to_k = nn.Linear(dim, dim, bias=False)
         self.to_v = nn.Linear(dim, dim, bias=False)
@@ -443,12 +454,12 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
 
     def cal_attention_flash(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         """
-        Flash Attention implementation using Dao-AILab's flash_attn_func
+        Memory-efficient attention optimized for T4 GPU
+        Uses chunked attention to reduce memory usage
         """
         b, n, device = x.shape[0], x.shape[-2], x.device
         
-        # Prepare Q, K, V for Flash Attention
-        # Reshape to (batch, seq_len, num_heads, head_dim)
+        # Prepare Q, K, V for attention
         q = self.to_q(x).view(b, n, self.num_heads, self.head_dim)
         k = self.to_k(x).view(b, n, self.num_heads, self.head_dim)
         v = self.to_v(x).view(b, n, self.num_heads, self.head_dim)
@@ -458,17 +469,10 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
             q = self.rotary_pos_emb.rotate_queries_or_keys(q)
             k = self.rotary_pos_emb.rotate_queries_or_keys(k)
         
-        # Use Flash Attention
-        if self.use_flash_attn:
-            # Flash Attention expects (batch, seq_len, num_heads, head_dim)
-            attn_out = flash_attn_func(
-                q, k, v,
-                dropout_p=self.dropout.p if self.training else 0.0,
-                causal=self.causal,
-                softmax_scale=1.0 / math.sqrt(self.head_dim)
-            )
+        # Use chunked attention for T4 compatibility
+        if n > self.chunk_size:
+            attn_out = self.chunked_attention(q, k, v, mask)
         else:
-            # Fallback to standard attention
             attn_out = self.standard_attention(q, k, v, mask)
         
         # Reshape back to (batch, seq_len, dim)
@@ -510,6 +514,33 @@ class FLASH_ShareA_FFConvM_FlashAttn(nn.Module):
         
         # Reshape back to (b, n, num_heads, head_dim)
         out = out.transpose(1, 2)
+        
+        return out
+
+    def chunked_attention(self, q, k, v, mask=None):
+        """
+        Memory-efficient chunked attention for T4 GPU
+        Processes attention in smaller chunks to reduce memory usage
+        """
+        b, n, num_heads, head_dim = q.shape
+        chunk_size = self.chunk_size
+        
+        # Initialize output
+        out = torch.zeros_like(q)
+        
+        # Process in chunks
+        for i in range(0, n, chunk_size):
+            end_i = min(i + chunk_size, n)
+            q_chunk = q[:, i:end_i]
+            
+            # Compute attention for this chunk
+            chunk_out = self.standard_attention(q_chunk, k, v, mask)
+            out[:, i:end_i] = chunk_out
+            
+            # Clear intermediate tensors to save memory
+            del q_chunk, chunk_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         return out
 
@@ -747,35 +778,22 @@ class MossformerBlock_GFSMN(nn.Module):
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
         
-        # Use Flash Attention if available, otherwise fallback to original
-        if FLASH_ATTN_AVAILABLE:
-            print("Using Flash Attention for GFSMN")
-            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
-                dim = dim, 
-                group_size = group_size, 
-                query_key_dim = query_key_dim, 
-                expansion_factor = expansion_factor, 
-                causal = causal, 
-                dropout = attn_dropout, 
-                rotary_pos_emb = rotary_pos_emb, 
-                norm_klass = norm_klass, 
-                shift_tokens = shift_tokens,
-                num_heads = 8,
-                use_flash_attn = True
-            ) for _ in range(depth)])
-        else:
-            print("Using standard attention for GFSMN")
-            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(
-                dim = dim, 
-                group_size = group_size, 
-                query_key_dim = query_key_dim, 
-                expansion_factor = expansion_factor, 
-                causal = causal, 
-                dropout = attn_dropout, 
-                rotary_pos_emb = rotary_pos_emb, 
-                norm_klass = norm_klass, 
-                shift_tokens = shift_tokens
-            ) for _ in range(depth)])
+        # Use optimized attention for T4 GPU
+        print("Using memory-efficient attention optimized for T4 GPU")
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
+            dim = dim, 
+            group_size = group_size, 
+            query_key_dim = query_key_dim, 
+            expansion_factor = expansion_factor, 
+            causal = causal, 
+            dropout = attn_dropout, 
+            rotary_pos_emb = rotary_pos_emb, 
+            norm_klass = norm_klass, 
+            shift_tokens = shift_tokens,
+            num_heads = 8,
+            use_flash_attn = FLASH_ATTN_AVAILABLE,
+            chunk_size = 256  # Smaller chunks for T4
+        ) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -824,35 +842,22 @@ class MossformerBlock(nn.Module):
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         
-        # Use Flash Attention if available, otherwise fallback to original
-        if FLASH_ATTN_AVAILABLE:
-            print("Using Flash Attention for MossformerBlock")
-            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
-                dim = dim, 
-                group_size = group_size, 
-                query_key_dim = query_key_dim, 
-                expansion_factor = expansion_factor, 
-                causal = causal, 
-                dropout = attn_dropout, 
-                rotary_pos_emb = rotary_pos_emb, 
-                norm_klass = norm_klass, 
-                shift_tokens = shift_tokens,
-                num_heads = 8,
-                use_flash_attn = True
-            ) for _ in range(depth)])
-        else:
-            print("Using standard attention for MossformerBlock")
-            self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(
-                dim = dim, 
-                group_size = group_size, 
-                query_key_dim = query_key_dim, 
-                expansion_factor = expansion_factor, 
-                causal = causal, 
-                dropout = attn_dropout, 
-                rotary_pos_emb = rotary_pos_emb, 
-                norm_klass = norm_klass, 
-                shift_tokens = shift_tokens
-            ) for _ in range(depth)])
+        # Use optimized attention for T4 GPU
+        print("Using memory-efficient attention optimized for T4 GPU")
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM_FlashAttn(
+            dim = dim, 
+            group_size = group_size, 
+            query_key_dim = query_key_dim, 
+            expansion_factor = expansion_factor, 
+            causal = causal, 
+            dropout = attn_dropout, 
+            rotary_pos_emb = rotary_pos_emb, 
+            norm_klass = norm_klass, 
+            shift_tokens = shift_tokens,
+            num_heads = 8,
+            use_flash_attn = FLASH_ATTN_AVAILABLE,
+            chunk_size = 256  # Smaller chunks for T4
+        ) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
