@@ -271,18 +271,18 @@ class FLASH_ShareA_FFConvM(nn.Module):
     def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
         """
         Attention calculation using PyTorch's scaled_dot_product_attention (SDPA).
-        Requires PyTorch >= 2.0 (you are on 2.6 + CUDA 12.4 so FlashAttention kernels are available).
+        Assumes PyTorch >= 2.0 (you said 2.6) and CUDA >= 12.4.
         Returns:
             att_v, att_u  # (batch, seq_len, dim)
         """
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
 
-        # --- linear attention pre-mask ---
+        # --- linear attention pre-mask (original behaviour) ---
         if exists(mask):
             lin_mask = rearrange(mask, '... -> ... 1')
             lin_k = lin_k.masked_fill(~lin_mask, 0.)
 
-        # rotary embeddings if enabled
+        # rotary embeddings if enabled (keeps original behaviour)
         if exists(self.rotary_pos_emb):
             quad_q, lin_q, quad_k, lin_k = map(
                 self.rotary_pos_emb.rotate_queries_or_keys,
@@ -306,22 +306,36 @@ class FLASH_ShareA_FFConvM(nn.Module):
         )
 
         if exists(mask):
+            # mask currently shape (b, g*n) before grouping; make it (b, g, 1, n) earlier,
+            # here we assume mask was arranged to 'b g 1 j' before calling; if not, adjust accordingly.
             mask = rearrange(mask, 'b (g j) -> b g 1 j', j=g)
 
         # ============================================================
-        # Quadratic part using scaled_dot_product_attention (FlashAttention inside PyTorch)
+        # Quadratic part using scaled_dot_product_attention (PyTorch)
         # ============================================================
         B, G = quad_q.shape[0], quad_q.shape[1]
-        q = rearrange(quad_q, 'b g n d -> (b g) n d')
-        k = rearrange(quad_k, 'b g n d -> (b g) n d')
-        v_for_quad = rearrange(v, 'b g n d -> (b g) n d')
-        u_for_quad = rearrange(u, 'b g n d -> (b g) n d')
+        q = rearrange(quad_q, 'b g n d -> (b g) n d').contiguous()   # (B_g, N, D)
+        k = rearrange(quad_k, 'b g n d -> (b g) n d').contiguous()
+        v_for_quad = rearrange(v, 'b g n d -> (b g) n d').contiguous()
+        u_for_quad = rearrange(u, 'b g n d -> (b g) n d').contiguous()
 
-        # attn mask for SDPA: shape (B*G, 1, N, N)
+        # --- create attn_mask in correct shape for SDPA ---
+        # Desired: attn_mask = None or shape (B_g, 1, N, N) (bool mask where True==masked)
         attn_mask = None
         if exists(mask):
-            attn_mask = rearrange(mask, 'b g 1 j -> (b g) 1 1 j')
+            # mask currently (b, g, 1, j) where j == N
+            # make (B_g, N) first: True = valid positions
+            mask_per_group = rearrange(mask, 'b g 1 j -> (b g) j')    # (B_g, N) boolean (True==valid)
+            # SDPA expects attn_mask true where positions are to be masked,
+            # so invert (we want True for masked positions)
+            masked_positions = ~mask_per_group                      # (B_g, N)
+            # expand to (B_g, 1, N, N): for each query (dim2) and each key (dim3),
+            # set True if key is masked. This allows broadcasting over heads.
+            # We place mask on key axis and broadcast over queries axis:
+            attn_mask = masked_positions[:, None, None, :].expand(-1, 1, mask_per_group.shape[1], -1).to(device)
+            # attn_mask dtype bool is acceptable for scaled_dot_product_attention
 
+        # Call SDPA. PyTorch will dispatch to efficient kernel (FlashAttention) if available.
         quad_out_v = torch.nn.functional.scaled_dot_product_attention(
             q, k, v_for_quad,
             attn_mask=attn_mask,
@@ -339,7 +353,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         quad_out_u = rearrange(quad_out_u, '(b g) n d -> b g n d', b=B, g=G)
 
         # ============================================================
-        # Linear attention part (giữ nguyên như code gốc)
+        # Linear attention part (original behaviour preserved)
         # ============================================================
         if self.causal:
             lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
@@ -358,20 +372,21 @@ class FLASH_ShareA_FFConvM(nn.Module):
             lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
             lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
 
-        # --- combine ---
+        # combine quadratic + linear
         att_v = quad_out_v + lin_out_v
         att_u = quad_out_u + lin_out_u
 
-        # reshape back
+        # reshape back to (b, seq_len, d)
         att_v = rearrange(att_v, 'b g n d -> b (g n) d')
         att_u = rearrange(att_u, 'b g n d -> b (g n) d')
 
-        # remove padding if added
+        # remove padding if any was added
         if padding > 0:
             att_v = att_v[:, :n, :]
             att_u = att_u[:, :n, :]
 
         return att_v, att_u
+
 
 class Gated_FSMN(nn.Module):
     def __init__(
