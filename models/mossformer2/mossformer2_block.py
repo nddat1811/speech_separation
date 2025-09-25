@@ -270,19 +270,21 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
     def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
         """
-        Attention calculation using PyTorch's scaled_dot_product_attention (SDPA).
-        Assumes PyTorch >= 2.0 (you said 2.6) and CUDA >= 12.4.
+        Multi-head version using PyTorch SDPA.
+        Works on PyTorch >=2.0 (you have 2.6 + CUDA 12.4).
         Returns:
             att_v, att_u  # (batch, seq_len, dim)
         """
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
+        h = self.heads            # số heads (đã định nghĩa trong __init__)
+        d = self.query_key_dim     # dimension mỗi head (head_dim)
 
-        # --- linear attention pre-mask (original behaviour) ---
+        # --- linear part pre-mask ---
         if exists(mask):
             lin_mask = rearrange(mask, '... -> ... 1')
             lin_k = lin_k.masked_fill(~lin_mask, 0.)
 
-        # rotary embeddings if enabled (keeps original behaviour)
+        # rotary embeddings
         if exists(self.rotary_pos_emb):
             quad_q, lin_q, quad_k, lin_k = map(
                 self.rotary_pos_emb.rotate_queries_or_keys,
@@ -301,48 +303,36 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
         # --- group reshape ---
         quad_q, quad_k, lin_q, lin_k, v, u = map(
-            lambda t: rearrange(t, 'b (g n) d -> b g n d', n=self.group_size),
+            lambda t: rearrange(t, 'b (g n) (h d) -> b g n h d', n=self.group_size, h=h),
             (quad_q, quad_k, lin_q, lin_k, v, u)
         )
 
         if exists(mask):
-            # mask currently shape (b, g*n) before grouping; make it (b, g, 1, n) earlier,
-            # here we assume mask was arranged to 'b g 1 j' before calling; if not, adjust accordingly.
-            mask = rearrange(mask, 'b (g j) -> b g 1 j', j=g)
+            mask = rearrange(mask, 'b (g j) -> b g j', j=g)   # (b, g, n)
 
         # ============================================================
-        # Quadratic part using scaled_dot_product_attention (PyTorch)
+        # Quadratic part via scaled_dot_product_attention
         # ============================================================
-        B, G = quad_q.shape[0], quad_q.shape[1]
-        q = rearrange(quad_q, 'b g n d -> (b g) n d').contiguous()   # (B_g, N, D)
-        k = rearrange(quad_k, 'b g n d -> (b g) n d').contiguous()
-        v_for_quad = rearrange(v, 'b g n d -> (b g) n d').contiguous()
-        u_for_quad = rearrange(u, 'b g n d -> (b g) n d').contiguous()
+        B, G, N = quad_q.shape[0], quad_q.shape[1], quad_q.shape[2]
+        q = rearrange(quad_q, 'b g n h d -> (b g) h n d')
+        k = rearrange(quad_k, 'b g n h d -> (b g) h n d')
+        v_for_quad = rearrange(v, 'b g n h d -> (b g) h n d')
+        u_for_quad = rearrange(u, 'b g n h d -> (b g) h n d')
 
-        # --- create attn_mask in correct shape for SDPA ---
-        # Desired: attn_mask = None or shape (B_g, 1, N, N) (bool mask where True==masked)
         attn_mask = None
         if exists(mask):
-            # mask currently (b, g, 1, j) where j == N
-            # make (B_g, N) first: True = valid positions
-            mask_per_group = rearrange(mask, 'b g 1 j -> (b g) j')    # (B_g, N) boolean (True==valid)
-            # SDPA expects attn_mask true where positions are to be masked,
-            # so invert (we want True for masked positions)
-            masked_positions = ~mask_per_group                      # (B_g, N)
-            # expand to (B_g, 1, N, N): for each query (dim2) and each key (dim3),
-            # set True if key is masked. This allows broadcasting over heads.
-            # We place mask on key axis and broadcast over queries axis:
-            attn_mask = masked_positions[:, None, None, :].expand(-1, 1, mask_per_group.shape[1], -1).to(device)
-            # attn_mask dtype bool is acceptable for scaled_dot_product_attention
+            # mask: (b, g, n) valid=True
+            mask_per_group = rearrange(mask, 'b g n -> (b g) n')      # (B_g, N)
+            masked_positions = ~mask_per_group                        # True=mask out
+            attn_mask = masked_positions[:, None, None, :].expand(-1, h, N, -1)  # (B_g, h, N, N)
 
-        # Call SDPA. PyTorch will dispatch to efficient kernel (FlashAttention) if available.
         quad_out_v = torch.nn.functional.scaled_dot_product_attention(
             q, k, v_for_quad,
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=self.causal
-        )
-        quad_out_v = rearrange(quad_out_v, '(b g) n d -> b g n d', b=B, g=G)
+        )   # (B_g, h, N, d)
+        quad_out_v = rearrange(quad_out_v, '(b g) h n d -> b g n (h d)', b=B, g=G)
 
         quad_out_u = torch.nn.functional.scaled_dot_product_attention(
             q, k, u_for_quad,
@@ -350,42 +340,46 @@ class FLASH_ShareA_FFConvM(nn.Module):
             dropout_p=0.0,
             is_causal=self.causal
         )
-        quad_out_u = rearrange(quad_out_u, '(b g) n d -> b g n d', b=B, g=G)
+        quad_out_u = rearrange(quad_out_u, '(b g) h n d -> b g n (h d)', b=B, g=G)
 
         # ============================================================
-        # Linear attention part (original behaviour preserved)
+        # Linear attention part (giữ nguyên)
         # ============================================================
         if self.causal:
-            lin_kv = einsum('b g n d, b g n e -> b g d e', lin_k, v) / g
+            lin_kv = einsum('b g n h d, b g n h e -> b g h d e', lin_k, v) / g
             lin_kv = lin_kv.cumsum(dim=1)
             lin_kv = F.pad(lin_kv, (0, 0, 0, 0, 1, -1), value=0.0)
-            lin_out_v = einsum('b g d e, b g n d -> b g n e', lin_kv, lin_q)
+            lin_out_v = einsum('b g h d e, b g n h d -> b g n h e', lin_kv, lin_q)
 
-            lin_ku = einsum('b g n d, b g n e -> b g d e', lin_k, u) / g
+            lin_ku = einsum('b g n h d, b g n h e -> b g h d e', lin_k, u) / g
             lin_ku = lin_ku.cumsum(dim=1)
             lin_ku = F.pad(lin_ku, (0, 0, 0, 0, 1, -1), value=0.0)
-            lin_out_u = einsum('b g d e, b g n d -> b g n e', lin_ku, lin_q)
+            lin_out_u = einsum('b g h d e, b g n h d -> b g n h e', lin_ku, lin_q)
         else:
-            lin_kv = einsum('b g n d, b g n e -> b d e', lin_k, v) / n
-            lin_out_v = einsum('b g n d, b d e -> b g n e', lin_q, lin_kv)
+            lin_kv = einsum('b g n h d, b g n h e -> b h d e', lin_k, v) / n
+            lin_out_v = einsum('b g n h d, b h d e -> b g n h e', lin_q, lin_kv)
 
-            lin_ku = einsum('b g n d, b g n e -> b d e', lin_k, u) / n
-            lin_out_u = einsum('b g n d, b d e -> b g n e', lin_q, lin_ku)
+            lin_ku = einsum('b g n h d, b g n h e -> b h d e', lin_k, u) / n
+            lin_out_u = einsum('b g n h d, b h d e -> b g n h e', lin_q, lin_ku)
 
-        # combine quadratic + linear
+        lin_out_v = rearrange(lin_out_v, 'b g n h e -> b g n (h e)')
+        lin_out_u = rearrange(lin_out_u, 'b g n h e -> b g n (h e)')
+
+        # --- combine ---
         att_v = quad_out_v + lin_out_v
         att_u = quad_out_u + lin_out_u
 
-        # reshape back to (b, seq_len, d)
+        # reshape back
         att_v = rearrange(att_v, 'b g n d -> b (g n) d')
         att_u = rearrange(att_u, 'b g n d -> b (g n) d')
 
-        # remove padding if any was added
+        # remove padding if added
         if padding > 0:
             att_v = att_v[:, :n, :]
             att_u = att_u[:, :n, :]
 
         return att_v, att_u
+
 
 
 class Gated_FSMN(nn.Module):
