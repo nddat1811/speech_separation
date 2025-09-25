@@ -216,7 +216,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.to_qk = nn.Linear(dim, query_key_dim, bias=False)
         self.to_hidden = nn.Linear(dim, hidden_dim * 2, bias=False)
         self.to_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.to_out = nn.Linear(hidden_dim * 2, dim, bias=False)  # Điều chỉnh nếu cần
+        self.to_out = nn.Linear(hidden_dim * 5, dim, bias=False)  # Sửa để khớp residual (hidden + out)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, *, mask=None):
@@ -247,8 +247,10 @@ class FLASH_ShareA_FFConvM(nn.Module):
             x = torch.cat((x_shift, x_pass), dim=-1)
 
         # Queries, keys
-        qk = self.to_qk(x)
-        qk_offsets = self.qk_offset_scale(qk.mean(dim=-2).mean(dim=-2))
+        qk = self.to_qk(x)  # [b, (g n), query_key_dim]
+        qk_reshaped = rearrange(qk, 'b (g n) d -> b g n d', g=g, n=n)  # [b, g, n, query_key_dim]
+        qk_mean = qk_reshaped.mean(dim=-2)  # Mean theo n, shape [b, g, query_key_dim]
+        qk_offsets = self.qk_offset_scale(qk_mean)  # [b, g, h, d] với h=4
         q_offset, k_offset, q_scale, k_scale = qk_offsets
         q = (qk * q_scale) + q_offset
         k = (qk * k_scale) + k_offset
@@ -258,8 +260,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
         # Rotary embeddings
         if exists(self.rotary_pos_emb):
-            # Dùng rotary_pos_emb trực tiếp để rotate queries và keys
-            q = self.rotary_pos_emb.rotate_queries_or_keys(q)  # Thay apply_rotary_pos_emb
+            q = self.rotary_pos_emb.rotate_queries_or_keys(q)
             k = self.rotary_pos_emb.rotate_queries_or_keys(k)
 
         # Shift one
@@ -267,7 +268,11 @@ class FLASH_ShareA_FFConvM(nn.Module):
         q_shift_one, k_shift_one = map(lambda t: F.pad(t, (0, 0, 1, -1), value=0.), (q_shift_one, k_shift_one))
         q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g n (h d) -> b g h n d', h=2), (q_shift_one, k_shift_one))
 
-        shift_one_offsets = self.shift_one_offset_scale(einsum('b g d, h -> b g h d', qk.mean(dim=-2), torch.ones((2,), device=device)))
+        # Sửa einsum cho shift_one_offset_scale
+        qk_mean_for_shift = qk_reshaped.mean(dim=-2)  # [b, g, query_key_dim]
+        shift_one_offsets = self.shift_one_offset_scale(
+            einsum('b g d, h -> b g h d', qk_mean_for_shift, torch.ones((2,), device=device))
+        )  # [b, g, h=2, d]
         q_shift_one_offset, k_shift_one_offset = shift_one_offsets
         q_shift_one = (q_shift_one * q_scale) + q_shift_one_offset
         k_shift_one = (k_shift_one * k_scale) + k_shift_one_offset
@@ -328,7 +333,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         out = rearrange(out, 'b g h n e -> b (g n) (h e)', h=4)
 
         # Combine with parallel feedforward
-        residual = torch.cat((hidden, out), dim=-1)
+        residual = torch.cat((hidden, out), dim=-1)  # hidden: [b, g, n, e], out: [b, g, n, 4e] -> residual: [b, g, n, 5e]
         out = self.to_out(residual)
         final_gate = F.silu(self.to_gate(x))
         out = out * final_gate
