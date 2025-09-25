@@ -314,33 +314,19 @@ class MossFormerM(nn.Module):
         group_size = 256,
         query_key_dim = 128,
         expansion_factor = 4.,
-        attn_dropout = 0.1,
-        use_flash_attn = True
+        attn_dropout = 0.1
     ):
         super().__init__()
-        # If requested, use the FlashAttention-backed MossformerBlock; else GFSMN variant
-        if use_flash_attn:
-            self.mossformerM = MossformerBlock_GFSMN(
-                               dim=d_model,
-                               depth=num_blocks,
-                               group_size=group_size,
-                               query_key_dim=query_key_dim,
-                               expansion_factor=expansion_factor,
-                               causal=causal,
-                               attn_dropout=attn_dropout,
-                               use_flash_attn=True
-                                  )
-            print('[MossFormerM] Using FlashAttention-backed MossformerBlock')
-        else:
-            self.mossformerM = MossformerBlock_GFSMN(
-                               dim=d_model,
-                               depth=num_blocks,
-                               group_size=group_size,
-                               query_key_dim=query_key_dim,
-                               expansion_factor=expansion_factor,
-                               causal=causal,
-                               attn_dropout=attn_dropout
-                                  )
+
+        self.mossformerM = MossformerBlock_GFSMN(
+                           dim=d_model,
+                           depth=num_blocks,
+                           group_size=group_size,
+                           query_key_dim=query_key_dim,
+                           expansion_factor=expansion_factor,
+                           causal=causal,
+                           attn_dropout=attn_dropout
+                              )
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
     def forward(
         self,
@@ -402,23 +388,19 @@ class MossFormerM2(nn.Module):
         group_size = 256,
         query_key_dim = 128,
         expansion_factor = 4.,
-        attn_dropout = 0.1,
-        use_flash_attn = True
+        attn_dropout = 0.1
     ):
         super().__init__()
 
         self.mossformerM = MossformerBlock(
-                            dim=d_model,
-                            depth=num_blocks,
-                            group_size=group_size,
-                            query_key_dim=query_key_dim,
-                            expansion_factor=expansion_factor,
-                            causal=causal,
-                            attn_dropout=attn_dropout,
-                            use_flash_attn=use_flash_attn
-                        )
-        if use_flash_attn:
-            print('[MossFormerM2] Using FlashAttention-backed MossformerBlock')
+                           dim=d_model,
+                           depth=num_blocks,
+                           group_size=group_size,
+                           query_key_dim=query_key_dim,
+                           expansion_factor=expansion_factor,
+                           causal=causal,
+                           attn_dropout=attn_dropout
+                              )
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
     def forward(

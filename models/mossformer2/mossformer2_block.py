@@ -10,29 +10,11 @@ from torch import nn, einsum
 from torchinfo import summary
 from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
-import os
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
 # functions
-
-# Optional FlashAttention v2 import
-try:
-    from flash_attn import flash_attn_func, flash_attn_qkvpacked_func  # noqa: F401
-    HAS_FLASH_ATTN = True
-except Exception:
-    HAS_FLASH_ATTN = False
-
-# Optional FlashAttention v1 import (Turing/T4 support)
-try:
-    from flash_attn import (
-        flash_attn_unpadded_func as flash_attn_v1_func,  # noqa: F401
-        flash_attn_unpadded_qkvpacked_func as flash_attn_v1_qkvpacked_func,  # noqa: F401
-    )
-    HAS_FLASH_ATTN_V1 = True
-except Exception:
-    HAS_FLASH_ATTN_V1 = False
 
 def identity(t, *args, **kwargs):
     return t
@@ -191,158 +173,91 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self,
         *,
         dim,
-        group_size=256,
-        query_key_dim=128,
-        expansion_factor=1.,
-        causal=False,
-        dropout=0.1,
-        rotary_pos_emb=None,
-        norm_klass=nn.LayerNorm,
-        shift_tokens=True,
-        use_flash_attn=False
+        group_size = 256,
+        query_key_dim = 128,
+        expansion_factor = 1.,
+        causal = False,
+        dropout = 0.1,
+        rotary_pos_emb = None,
+        norm_klass = nn.LayerNorm,
+        shift_tokens = True
     ):
         super().__init__()
-        hidden_dim = int(expansion_factor * dim)
+        hidden_dim = int(dim * expansion_factor)        
         self.group_size = group_size
         self.causal = causal
         self.shift_tokens = shift_tokens
-        self.use_flash_attn = use_flash_attn and (HAS_FLASH_ATTN or HAS_FLASH_ATTN_V1)
-        self.head_dim = query_key_dim // 4  # 4 heads (p=2, h=2)
 
+        # positional embeddings
         self.rotary_pos_emb = rotary_pos_emb
-        self.qk_offset_scale = OffsetScale(query_key_dim, heads=4)
-        self.shift_one_offset_scale = OffsetScale(query_key_dim, heads=2)
-        self.norm = norm_klass(dim)
-        self.to_qk = nn.Linear(dim, query_key_dim, bias=False)
-        self.to_hidden = nn.Linear(dim, hidden_dim * 2, bias=False)
-        self.to_gate = nn.Linear(dim, hidden_dim, bias=False)
-        self.to_out = nn.Linear(hidden_dim * 5, dim, bias=False)  # Sửa để khớp residual (hidden + out)
+        # norm
         self.dropout = nn.Dropout(dropout)
+        # projections
+        
+        self.to_hidden = FFConvM(
+            dim_in = dim,
+            dim_out = hidden_dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
+        self.to_qk = FFConvM(
+            dim_in = dim,
+            dim_out = query_key_dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
 
-    def forward(self, x, *, mask=None):
+        self.qk_offset_scale = OffsetScale(query_key_dim, heads = 4)
+
+        self.to_out = FFConvM(
+            dim_in = dim*2,
+            dim_out = dim,
+            norm_klass = norm_klass,
+            dropout = dropout,
+            )
+        
+        self.gateActivate=nn.Sigmoid() 
+
+    def forward(
+        self,
+        x,
+        *,
+        mask = None
+    ):
+
         """
         b - batch
         n - sequence length (within groups)
         g - group dimension
         d - feature dimension (keys)
         e - feature dimension (values)
+        i - sequence dimension (source)
+        j - sequence dimension (target)
         """
-        b, seq, device, g = x.shape[0], x.shape[1], x.device, self.group_size
 
-        # Pad sequence để chia hết cho group_size
-        padding = padding_to_multiple_of(seq, g)
-        if padding > 0:
-            x = F.pad(x, (0, 0, 0, padding), value=0.)
-            seq = seq + padding
+        # prenorm
+        #x = self.fsmn(x)
+        normed_x = x #self.norm(x)
 
-        n = seq // g  # seq chia hết cho g
+        # do token shift - a great, costless trick from an independent AI researcher in Shenzhen
+        residual = x
 
-        # Norm
-        x = self.norm(x)
-
-        # Shift sequence
         if self.shift_tokens:
-            x_shift, x_pass = x.chunk(2, dim=-1)
-            x_shift = F.pad(x_shift, (0, 0, 1, -1), value=0.)
-            x = torch.cat((x_shift, x_pass), dim=-1)
+            x_shift, x_pass = normed_x.chunk(2, dim = -1)
+            x_shift = F.pad(x_shift, (0, 0, 1, -1), value = 0.)
+            normed_x = torch.cat((x_shift, x_pass), dim = -1)
 
-        # Queries, keys
-        qk = self.to_qk(x)  # [b, (g n), query_key_dim]
-        qk_reshaped = rearrange(qk, 'b (g n) d -> b g n d', g=g, n=n)  # [b, g, n, query_key_dim]
-        qk_mean = qk_reshaped.mean(dim=-2)  # Mean theo n, shape [b, g, query_key_dim]
-        qk_offsets = self.qk_offset_scale(qk_mean)  # [b, g, h, d] với h=4
-        q_offset, k_offset, q_scale, k_scale = qk_offsets
-        q = (qk * q_scale) + q_offset
-        k = (qk * k_scale) + k_offset
+        # initial projections
+        v, u = self.to_hidden(normed_x).chunk(2, dim = -1)
+        qk = self.to_qk(normed_x)
 
-        # Split heads
-        q, k = map(lambda t: rearrange(t, 'b (g n) (h d) -> b g h n d', g=g, h=2, n=n, d=self.head_dim * 2), (q, k))
+        # offset and scale
+        quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
+        att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u)
 
-        # Rotary embeddings
-        if exists(self.rotary_pos_emb):
-            q = self.rotary_pos_emb.rotate_queries_or_keys(q)
-            k = self.rotary_pos_emb.rotate_queries_or_keys(k)
-
-        # Shift one
-        q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g h n d -> b g n (h d)'), (q, k))
-        q_shift_one, k_shift_one = map(lambda t: F.pad(t, (0, 0, 1, -1), value=0.), (q_shift_one, k_shift_one))
-        q_shift_one, k_shift_one = map(lambda t: rearrange(t, 'b g n (h d) -> b g h n d', h=2), (q_shift_one, k_shift_one))
-
-        # Sửa einsum cho shift_one_offset_scale
-        qk_mean_for_shift = qk_reshaped.mean(dim=-2)  # [b, g, query_key_dim]
-        shift_one_offsets = self.shift_one_offset_scale(
-            einsum('b g d, h -> b g h d', qk_mean_for_shift, torch.ones((2,), device=device))
-        )  # [b, g, h=2, d]
-        q_shift_one_offset, k_shift_one_offset = shift_one_offsets
-        q_shift_one = (q_shift_one * q_scale) + q_shift_one_offset
-        k_shift_one = (k_shift_one * k_scale) + k_shift_one_offset
-
-        # Merge heads
-        q = torch.stack((q, q_shift_one), dim=2)
-        k = torch.stack((k, k_shift_one), dim=2)
-        q, k = map(lambda t: rearrange(t, 'b g p h n d -> b g (p h) n d', p=2, h=2), (q, k))
-
-        # Hidden states and gate
-        hidden, gate = self.to_hidden(x).chunk(2, dim=-1)
-        hidden = rearrange(hidden, 'b (g n) e -> b g n e', g=g, n=n)
-
-        # Attention
-        with autocast(enabled=True, device_type='cuda', dtype=torch.bfloat16):
-            if self.use_flash_attn:
-                q_flash = rearrange(q, 'b g h n d -> (b g) n h d', h=4)
-                k_flash = rearrange(k, 'b g h n d -> (b g) n h d', h=4)
-                v_flash = rearrange(hidden, 'b g n e -> (b g) n 1 e')
-
-                if HAS_FLASH_ATTN:
-                    out = flash_attn_func(
-                        q_flash, k_flash, v_flash,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        causal=self.causal
-                    )
-                elif HAS_FLASH_ATTN_V1:
-                    out = flash_attn_v1_func(
-                        q_flash, k_flash, v_flash,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        causal=self.causal
-                    )
-                else:
-                    out = F.scaled_dot_product_attention(
-                        q_flash, k_flash, v_flash,
-                        attn_mask=mask,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        is_causal=self.causal
-                    )
-                out = rearrange(out, '(b g) n h d -> b g h n d', g=g, h=4)
-            else:
-                sim = einsum('b g h i d, b g h j d -> b g h i j', q, k) * (self.head_dim ** -0.5)
-                i, j = sim.shape[-2], sim.shape[-1]
-                causal_mask = torch.ones((i, j), dtype=torch.bool, device=device).triu(j - i + 1)
-                sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
-                if exists(mask):
-                    mask = rearrange(mask, 'b (g n) -> b g n', g=g, n=n)
-                    mask = F.pad(mask, (1, 0), value=False)
-                    mask = rearrange(mask, 'b g n -> b g 1 1 n')
-                    sim = sim.masked_fill(~mask, -torch.finfo(sim.dtype).max)
-                attn = sim.softmax(dim=-1)
-                attn = self.dropout(attn)
-                out = einsum('b g h i j, b g j e -> b g h i e', attn, hidden)
-
-        # Final gate
-        gate = rearrange(gate, 'b (g n) e -> b g n e', g=g, n=n)
-        out = F.silu(out) * gate
-        out = rearrange(out, 'b g h n e -> b (g n) (h e)', h=4)
-
-        # Combine with parallel feedforward
-        residual = torch.cat((hidden, out), dim=-1)  # hidden: [b, g, n, e], out: [b, g, n, 4e] -> residual: [b, g, n, 5e]
-        out = self.to_out(residual)
-        final_gate = F.silu(self.to_gate(x))
-        out = out * final_gate
-
-        # Cắt padding nếu có
-        if padding > 0:
-            out = out[:, :seq - padding, :]
-
-        return out + x
+        out = (att_u*v ) * self.gateActivate(att_v*u)
+        x = x + self.to_out(out)
+        return x
 
     def cal_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
@@ -370,75 +285,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         if exists(mask):
             mask = rearrange(mask, 'b (g j) -> b g 1 j', j = g)
 
-        # -------------------------
-        # Quadratic attention part
-        # -------------------------
-        # Default (original) quadratic computation:
-        # sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
-        # attn = F.relu(sim) ** 2
-        # attn = self.dropout(attn)
-        # ...
-        # We try to use flash_attn to compute efficient QK interaction if requested,
-        # but we must convert the pairwise similarity into the format flash_attn expects
-        # (flash_attn expects a softmax attention). Since the original uses relu(sim)^2
-        # (not softmax), we cannot perfectly replicate that with flash_attn.
-        # Here we use flash_attn to compute standard softmax attention (q @ k^T -> softmax),
-        # then apply a nonlinearity to the resulting attention weights to approximate behavior.
-        # This is an approximation - the primary goal is runtime & memory speedup.
-        # If exact original behavior is desired, set use_flash_attn=False.
-
-        if self.use_flash_attn:
-            # We'll compute Q,K,V for flash_attn from quad_q, quad_k and v.
-            # quad_q, quad_k, v are in shape (b, g, n, d)
-            # We'll merge batch and groups: (b*g, n, d)
-            try:
-                b_g = b * quad_q.shape[1]
-                q = quad_q.reshape(b_g, quad_q.shape[2], quad_q.shape[3])  # (b*g, n, d)
-                k = quad_k.reshape(b_g, quad_k.shape[2], quad_k.shape[3])  # (b*g, n, d)
-                # For V we use v grouped similarly but need same dim as q/k; if v has different dim we project
-                v_grp = v.reshape(b_g, v.shape[2], v.shape[3])  # (b*g, n, d_v)
-                # If v dim differs from q/k dim, project v to q/k dim via linear (use to_out weights implicitly).
-                # To avoid adding new params here, if dims mismatch we fallback to original einsum path.
-                if q.shape[-1] != v_grp.shape[-1]:
-                    raise RuntimeError("flash path: q/k dim != v dim; falling back to original attention")
-                # flash_attn_func expects tensors shaped (batch, seqlen, heads, head_dim),
-                # so we need to split the last dim into (heads, head_dim)
-                # We'll choose heads = 1 because quad dims come as single-head features
-                heads = 1
-                head_dim = q.shape[-1]
-                q = q.unsqueeze(2)  # (b*g, n, 1, head_dim)
-                k = k.unsqueeze(2)
-                v_in = v_grp.unsqueeze(2)
-                # call flash_attn_func. Use try multiple API names for compatibility.
-                if HAS_FLASH_ATTN:
-                    # flash_attn_func(q, k, v, dropout_p, causal=False)
-                    quad_attn = flash_attn_func(q, k, v_in, 0.0, causal=False)
-                    # quad_attn shape -> (b*g, n, heads, head_dim)
-                    quad_attn = quad_attn.squeeze(2)  # (b*g, n, head_dim)
-                    # approximate original: apply squared ReLU on similarity approximation:
-                    attn_weights_approx = F.relu(quad_attn).pow(2)
-                    # Now multiply back with v to get outputs: einsum over sequence dimension to simulate original:
-                    # But we don't have similarity matrix directly; as an approximation, use quad_attn as "values"
-                    quad_out_v = attn_weights_approx
-                    quad_out_u = attn_weights_approx
-                    # reshape back to (b, g, n, d)
-                    quad_out_v = quad_out_v.reshape(b, -1, self.group_size, quad_out_v.shape[-1]).transpose(1,2).reshape(b, self.group_size * quad_out_v.shape[-1] // quad_out_v.shape[-1], quad_out_v.shape[-1])  # best-effort reshape (safe fallback below)
-                    # The approximation above is hacky; we will attempt more robust fallback below if shapes mismatch
-                    # For safety, if anything goes wrong we fallback to original path
-                    raise RuntimeError("flash path used but not fully supported for exact original attention. Falling back.")
-                elif HAS_FLASH_ATTN_V1:
-                    # older API
-                    quad_attn = flash_attn_v1_func(q, k, v_in, 0.0, False)
-                    raise RuntimeError("flash v1 path used but not fully supported for exact original attention. Falling back.")
-                else:
-                    raise RuntimeError("No flash_attn available at runtime (unexpected).")
-            except Exception:
-                # If flash path fails, fallback to original path (safe).
-                self.use_flash_attn = False  # disable for subsequent calls to avoid repeated attempts
-                # print once
-                # print("[FLASH_ShareA_FFConvM] flash path failed or not applicable; falling back to original attention implementation.")
-
-        # Original quadratic attention (fallback / default)
+        # calculate quadratic attention output
         sim = einsum('... i d, ... j d -> ... i j', quad_q, quad_k) / g
 
         attn = F.relu(sim) ** 2
@@ -506,9 +353,9 @@ class Gated_FSMN(nn.Module):
     ):
         input = x
         x_u = self.to_u(x)
-        x_v = self.to_v(x)
+        x_v = self.to_v(x) 
         x_u = self.fsmn(x_u)
-        x = x_v * x_u + input
+        x = x_v * x_u + input               
         return x
 
 class Gated_FSMN_dilated(nn.Module):
@@ -540,9 +387,9 @@ class Gated_FSMN_dilated(nn.Module):
     ):
         input = x
         x_u = self.to_u(x)
-        x_v = self.to_v(x)
+        x_v = self.to_v(x) 
         x_u = self.fsmn(x_u)
-        x = x_v * x_u + input
+        x = x_v * x_u + input               
         return x
 
 class Gated_FSMN_Block(nn.Module):
@@ -627,8 +474,7 @@ class MossformerBlock_GFSMN(nn.Module):
         causal = False,
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
-        shift_tokens = True,
-        use_flash_attn = False   # <-- new flag
+        shift_tokens = True
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -639,29 +485,12 @@ class MossformerBlock_GFSMN(nn.Module):
             norm_klass = nn.LayerNorm
 
         self.group_size = group_size
-        self.use_flash_attn = use_flash_attn and (HAS_FLASH_ATTN or HAS_FLASH_ATTN_V1)
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
-        # keep FSMN layers (Gated_FSMN_Block_Dilated)
+        # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-
-        # Build attention-like layers; these are the per-group modules.
-        # If use_flash_attn is requested but not available this will fallback to original module.
-        self.layers = nn.ModuleList([
-            FLASH_ShareA_FFConvM(
-                dim = dim,
-                group_size = group_size,
-                query_key_dim = query_key_dim,
-                expansion_factor = expansion_factor,
-                causal = causal,
-                dropout = attn_dropout,
-                rotary_pos_emb = rotary_pos_emb,
-                norm_klass = norm_klass,
-                shift_tokens = shift_tokens,
-                use_flash_attn = self.use_flash_attn
-            ) for _ in range(depth)
-        ])
-
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+  
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
             UniDeepFsmn(in_channels, out_channels, lorder, hidden_size)
@@ -694,21 +523,28 @@ class MossformerBlock(nn.Module):
         causal = False,
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
-        shift_tokens = True,
-        use_flash_attn = False
+        shift_tokens = True
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
 
         if norm_type == 'scalenorm':
             norm_klass = ScaleNorm
+        elif norm_type == 'layernorm':
+            norm_klass = nn.LayerNorm
 
         self.group_size = group_size
-        self.use_flash_attn = use_flash_attn and (HAS_FLASH_ATTN or HAS_FLASH_ATTN_V1)
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
-        # original block stacks
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = self.use_flash_attn) for _ in range(depth)])
+        # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+
+    def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
+        repeats = [
+            UniDeepFsmn(in_channels, out_channels, lorder, hidden_size)
+            for i in range(repeats)
+        ]
+        return nn.Sequential(*repeats)
 
     def forward(
         self,
@@ -721,5 +557,3 @@ class MossformerBlock(nn.Module):
             x = flash(x, mask = mask)
             ii = ii + 1
         return x
-
-# End of file
