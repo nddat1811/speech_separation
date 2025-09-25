@@ -14,6 +14,15 @@ from rotary_embedding_torch import RotaryEmbedding
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
+
+# Import Flash Attention
+from flash_attn import flash_attn_func
+FLASH_ATTN_AVAILABLE = True
+print("Flash Attention available")
+# try:
+# except ImportError:
+#     FLASH_ATTN_AVAILABLE = False
+#     print("Warning: Flash Attention not available. Using standard attention.")
 # functions
 
 def identity(t, *args, **kwargs):
@@ -180,13 +189,15 @@ class FLASH_ShareA_FFConvM(nn.Module):
         dropout = 0.1,
         rotary_pos_emb = None,
         norm_klass = nn.LayerNorm,
-        shift_tokens = True
+        shift_tokens = True,
+        use_flash_attn = True
     ):
         super().__init__()
         hidden_dim = int(dim * expansion_factor)        
         self.group_size = group_size
         self.causal = causal
         self.shift_tokens = shift_tokens
+        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
 
         # positional embeddings
         self.rotary_pos_emb = rotary_pos_emb
@@ -216,7 +227,13 @@ class FLASH_ShareA_FFConvM(nn.Module):
             dropout = dropout,
             )
         
-        self.gateActivate=nn.Sigmoid() 
+        self.gateActivate=nn.Sigmoid()
+        
+        # Flash Attention specific parameters
+        if self.use_flash_attn:
+            self.num_heads = 8  # Default number of heads for Flash Attention
+            self.head_dim = query_key_dim // self.num_heads
+            assert query_key_dim % self.num_heads == 0, f"query_key_dim ({query_key_dim}) must be divisible by num_heads ({self.num_heads})" 
 
     def forward(
         self,
@@ -255,7 +272,14 @@ class FLASH_ShareA_FFConvM(nn.Module):
         quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
         att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u)
 
-        out = (att_u*v ) * self.gateActivate(att_v*u)
+        # Handle Flash Attention output format
+        if self.use_flash_attn:
+            # Flash attention already returns the final attention outputs
+            out = torch.cat([att_v, att_u], dim=-1)
+        else:
+            # Original MossFormer2 gating mechanism
+            out = (att_u*v ) * self.gateActivate(att_v*u)
+        
         x = x + self.to_out(out)
         return x
 
@@ -269,6 +293,56 @@ class FLASH_ShareA_FFConvM(nn.Module):
         # rotate queries and keys
         if exists(self.rotary_pos_emb):
             quad_q, lin_q, quad_k, lin_k = map(self.rotary_pos_emb.rotate_queries_or_keys, (quad_q, lin_q, quad_k, lin_k))
+
+        if self.use_flash_attn:
+            return self.cal_flash_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+        else:
+            return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+
+    def cal_flash_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
+        """Flash Attention implementation for MossFormer2"""
+        b, n, device = x.shape[0], x.shape[-2], x.device
+        
+        # Prepare Q, K, V for Flash Attention
+        # Combine quad and lin queries/keys for Flash Attention
+        q_combined = torch.cat([quad_q, lin_q], dim=-1)  # [b, n, query_key_dim*2]
+        k_combined = torch.cat([quad_k, lin_k], dim=-1)  # [b, n, query_key_dim*2]
+        
+        # Reshape for multi-head attention
+        head_dim = self.head_dim
+        q_combined = q_combined.view(b, n, self.num_heads, head_dim)
+        k_combined = k_combined.view(b, n, self.num_heads, head_dim)
+        v = v.view(b, n, self.num_heads, head_dim)
+        u = u.view(b, n, self.num_heads, head_dim)
+        
+        # Apply Flash Attention
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+        
+        # Flash attention for v
+        attn_out_v = flash_attn_func(
+            q_combined, k_combined, v,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            softmax_scale=softmax_scale,
+            causal=self.causal
+        )
+        
+        # Flash attention for u
+        attn_out_u = flash_attn_func(
+            q_combined, k_combined, u,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            softmax_scale=softmax_scale,
+            causal=self.causal
+        )
+        
+        # Reshape back to original dimensions
+        attn_out_v = attn_out_v.view(b, n, -1)
+        attn_out_u = attn_out_u.view(b, n, -1)
+        
+        return attn_out_v, attn_out_u
+
+    def cal_standard_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
+        """Original MossFormer2 attention implementation"""
+        b, n, device, g = x.shape[0], x.shape[-2], x.device, self.group_size
 
         # padding for groups
         padding = padding_to_multiple_of(n, g)
@@ -489,7 +563,7 @@ class MossformerBlock_GFSMN(nn.Module):
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -537,7 +611,7 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
