@@ -15,14 +15,24 @@ from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
 
-# Import Flash Attention
-from flash_attn import flash_attn_func
-FLASH_ATTN_AVAILABLE = True
-print("Flash Attention available")
-# try:
-# except ImportError:
-#     FLASH_ATTN_AVAILABLE = False
-#     print("Warning: Flash Attention not available. Using standard attention.")
+# Import Flash Attention functions
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+    print("Flash Attention available")
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+    flash_attn_func = None
+    print("Warning: Flash Attention not available. Using PyTorch native attention.")
+
+# Use PyTorch's native scaled_dot_product_attention as fallback
+try:
+    from torch.nn.functional import scaled_dot_product_attention
+    TORCH_NATIVE_ATTN_AVAILABLE = True
+    print("PyTorch native scaled_dot_product_attention available")
+except ImportError:
+    TORCH_NATIVE_ATTN_AVAILABLE = False
+    scaled_dot_product_attention = None
 # functions
 
 def identity(t, *args, **kwargs):
@@ -197,7 +207,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.group_size = group_size
         self.causal = causal
         self.shift_tokens = shift_tokens
-        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
+        self.use_flash_attn = use_flash_attn and (FLASH_ATTN_AVAILABLE or TORCH_NATIVE_ATTN_AVAILABLE)
 
         # positional embeddings
         self.rotary_pos_emb = rotary_pos_emb
@@ -231,9 +241,14 @@ class FLASH_ShareA_FFConvM(nn.Module):
         
         # Flash Attention specific parameters
         if self.use_flash_attn:
-            self.num_heads = 8  # Default number of heads for Flash Attention
+            # Find the largest divisor of query_key_dim that's <= 16 (for efficiency)
+            max_heads = min(16, query_key_dim)
+            self.num_heads = 1
+            for i in range(1, max_heads + 1):
+                if query_key_dim % i == 0:
+                    self.num_heads = i
+            
             self.head_dim = query_key_dim // self.num_heads
-            assert query_key_dim % self.num_heads == 0, f"query_key_dim ({query_key_dim}) must be divisible by num_heads ({self.num_heads})" 
 
     def forward(
         self,
@@ -272,10 +287,15 @@ class FLASH_ShareA_FFConvM(nn.Module):
         quad_q, lin_q, quad_k, lin_k = self.qk_offset_scale(qk)
         att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u)
 
-        # Handle Flash Attention output format
-        if self.use_flash_attn:
-            # Flash attention already returns the final attention outputs
-            out = torch.cat([att_v, att_u], dim=-1)
+        # Handle optimized attention output format
+        if self.use_flash_attn and (FLASH_ATTN_AVAILABLE or TORCH_NATIVE_ATTN_AVAILABLE):
+            # Optimized attention already returns the final attention outputs
+            # Ensure output dimension matches expected dim*2
+            if att_v.shape[-1] + att_u.shape[-1] != x.shape[-1] * 2:
+                # If dimensions don't match, use original gating mechanism
+                out = (att_u*v ) * self.gateActivate(att_v*u)
+            else:
+                out = torch.cat([att_v, att_u], dim=-1)
         else:
             # Original MossFormer2 gating mechanism
             out = (att_u*v ) * self.gateActivate(att_v*u)
@@ -301,40 +321,146 @@ class FLASH_ShareA_FFConvM(nn.Module):
 
     def cal_flash_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
         """Flash Attention implementation for MossFormer2"""
-        b, n, device = x.shape[0], x.shape[-2], x.device
-        
-        # Use quad_q and quad_k for Flash Attention (simpler approach)
-        # Reshape for multi-head attention
-        head_dim = self.head_dim
-        q_flash = quad_q.view(b, n, self.num_heads, head_dim)
-        k_flash = quad_k.view(b, n, self.num_heads, head_dim)
-        v_flash = v.view(b, n, self.num_heads, head_dim)
-        u_flash = u.view(b, n, self.num_heads, head_dim)
-        
-        # Apply Flash Attention
-        softmax_scale = 1.0 / math.sqrt(head_dim)
-        
-        # Flash attention for v
-        attn_out_v = flash_attn_func(
-            q_flash, k_flash, v_flash,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            softmax_scale=softmax_scale,
-            causal=self.causal
-        )
-        
-        # Flash attention for u
-        attn_out_u = flash_attn_func(
-            q_flash, k_flash, u_flash,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            softmax_scale=softmax_scale,
-            causal=self.causal
-        )
-        
-        # Reshape back to original dimensions
-        attn_out_v = attn_out_v.view(b, n, -1)
-        attn_out_u = attn_out_u.view(b, n, -1)
-        
-        return attn_out_v, attn_out_u
+        try:
+            b, n, device = x.shape[0], x.shape[-2], x.device
+            original_dtype_v = v.dtype
+            original_dtype_u = u.dtype
+            
+            # Debug tensor shapes
+            # print(f"Debug: quad_q shape: {quad_q.shape}, v shape: {v.shape}")
+            # print(f"Debug: num_heads: {self.num_heads}, head_dim: {self.head_dim}")
+            
+            # Use quad_q and quad_k for Flash Attention (simpler approach)
+            # Reshape for multi-head attention
+            head_dim = self.head_dim
+            
+            # Check if dimensions are compatible
+            expected_size = b * n * self.num_heads * head_dim
+            actual_size = quad_q.numel()
+            
+            print(f"Debug: expected_size = {expected_size}, actual_size = {actual_size}")
+            print(f"Debug: quad_q.shape = {quad_q.shape}")
+            print(f"Debug: b={b}, n={n}, num_heads={self.num_heads}, head_dim={head_dim}")
+            
+            if actual_size != expected_size:
+                print(f"Dimension mismatch: expected {expected_size}, got {actual_size}")
+                # Try to fix the dimension by adjusting head_dim
+                actual_head_dim = actual_size // (b * n * self.num_heads)
+                if actual_head_dim * b * n * self.num_heads == actual_size:
+                    print(f"Adjusted head_dim from {head_dim} to {actual_head_dim}")
+                    head_dim = actual_head_dim
+                else:
+                    raise ValueError(f"Tensor size mismatch: {actual_size} != {expected_size}")
+            
+            q_flash = quad_q.view(b, n, self.num_heads, head_dim)
+            k_flash = quad_k.view(b, n, self.num_heads, head_dim)
+            
+            # Handle v and u with different dimensions
+            v_head_dim = v.shape[-1] // self.num_heads
+            u_head_dim = u.shape[-1] // self.num_heads
+            
+            print(f"Debug: v_head_dim = {v_head_dim}, u_head_dim = {u_head_dim}")
+            print(f"Debug: v.shape = {v.shape}, u.shape = {u.shape}")
+            
+            if v.shape[-1] % self.num_heads == 0:
+                v_flash = v.view(b, n, self.num_heads, v_head_dim)
+            else:
+                # If v dimension doesn't match, use original v
+                v_flash = v.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
+                v_head_dim = v.shape[-1]
+                
+            if u.shape[-1] % self.num_heads == 0:
+                u_flash = u.view(b, n, self.num_heads, u_head_dim)
+            else:
+                # If u dimension doesn't match, use original u
+                u_flash = u.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
+                u_head_dim = u.shape[-1]
+            
+            # Apply Flash Attention with multiple fallback options
+            softmax_scale = 1.0 / math.sqrt(head_dim)
+            
+            try:
+                # Check GPU architecture and choose appropriate attention
+                use_flash_attn = False
+                if torch.cuda.is_available():
+                    major, minor = torch.cuda.get_device_capability()
+                    # Flash Attention 2.x only supports Ampere (8.0+) and newer
+                    use_flash_attn = major >= 8
+                    print(f"GPU SM {major}.{minor}: {'Ampere+ (Flash Attention supported)' if use_flash_attn else 'Turing or older (PyTorch native)'}")
+                
+                # Try Flash Attention for supported GPUs
+                if use_flash_attn and FLASH_ATTN_AVAILABLE and flash_attn_func is not None:
+                    print("Using Flash Attention")
+                    # Ensure supported dtype for FlashAttention (fp16/bf16)
+                    attn_dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
+                    qf = q_flash.to(attn_dtype).contiguous()
+                    kf = k_flash.to(attn_dtype).contiguous()
+                    vf = v_flash.to(attn_dtype).contiguous()
+                    uf = u_flash.to(attn_dtype).contiguous()
+                    # Flash attention for v
+                    attn_out_v = flash_attn_func(
+                        qf, kf, vf,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        softmax_scale=softmax_scale,
+                        causal=self.causal
+                    )
+                    
+                    # Flash attention for u
+                    attn_out_u = flash_attn_func(
+                        qf, kf, uf,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        softmax_scale=softmax_scale,
+                        causal=self.causal
+                    )
+                    # Cast back to original dtypes
+                    attn_out_v = attn_out_v.to(original_dtype_v)
+                    attn_out_u = attn_out_u.to(original_dtype_u)
+                    
+                # Use PyTorch native attention for Turing and older GPUs
+                elif TORCH_NATIVE_ATTN_AVAILABLE and scaled_dot_product_attention is not None:
+                    print("Using PyTorch native attention (optimized for Turing/older GPUs)")
+                    # PyTorch native attention for v
+                    attn_out_v = scaled_dot_product_attention(
+                        q_flash, k_flash, v_flash,
+                        attn_mask=None,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        is_causal=self.causal,
+                        scale=softmax_scale
+                    )
+                    
+                    # PyTorch native attention for u
+                    attn_out_u = scaled_dot_product_attention(
+                        q_flash, k_flash, u_flash,
+                        attn_mask=None,
+                        dropout_p=self.dropout.p if self.training else 0.0,
+                        is_causal=self.causal,
+                        scale=softmax_scale
+                    )
+                    
+                else:
+                    raise ValueError("No optimized attention available")
+                    
+            except Exception as e:
+                print(f"Optimized attention failed: {e}")
+                raise e
+            
+            # Reshape back to original dimensions
+            if attn_out_v.shape[-1] == v_head_dim:
+                attn_out_v = attn_out_v.view(b, n, -1)
+            else:
+                attn_out_v = attn_out_v.view(b, n, -1)
+                
+            if attn_out_u.shape[-1] == u_head_dim:
+                attn_out_u = attn_out_u.view(b, n, -1)
+            else:
+                attn_out_u = attn_out_u.view(b, n, -1)
+            
+            return attn_out_v, attn_out_u
+            
+        except Exception as e:
+            print(f"Flash Attention failed: {e}")
+            # print("Falling back to standard attention...")
+            return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
     def cal_standard_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         """Original MossFormer2 attention implementation"""
