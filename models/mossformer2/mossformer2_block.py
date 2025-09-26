@@ -25,14 +25,6 @@ except ImportError:
     flash_attn_func = None
     print("Warning: Flash Attention not available. Using PyTorch native attention.")
 
-# Use PyTorch's native scaled_dot_product_attention as fallback
-try:
-    from torch.nn.functional import scaled_dot_product_attention
-    TORCH_NATIVE_ATTN_AVAILABLE = True
-    print("PyTorch native scaled_dot_product_attention available")
-except ImportError:
-    TORCH_NATIVE_ATTN_AVAILABLE = False
-    scaled_dot_product_attention = None
 # functions
 
 def identity(t, *args, **kwargs):
@@ -207,7 +199,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.group_size = group_size
         self.causal = causal
         self.shift_tokens = shift_tokens
-        self.use_flash_attn = use_flash_attn and (FLASH_ATTN_AVAILABLE or TORCH_NATIVE_ATTN_AVAILABLE)
+        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
 
         # positional embeddings
         self.rotary_pos_emb = rotary_pos_emb
@@ -288,7 +280,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         att_v, att_u = self.cal_attention(x, quad_q, lin_q, quad_k, lin_k, v, u)
 
         # Handle optimized attention output format
-        if self.use_flash_attn and (FLASH_ATTN_AVAILABLE or TORCH_NATIVE_ATTN_AVAILABLE):
+        if self.use_flash_attn and FLASH_ATTN_AVAILABLE:
             # Optimized attention already returns the final attention outputs
             # Ensure output dimension matches expected dim*2
             if att_v.shape[-1] + att_u.shape[-1] != x.shape[-1] * 2:
@@ -369,8 +361,12 @@ class FLASH_ShareA_FFConvM(nn.Module):
             
             # Reshape v for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
             # Ensure v has the same number of heads as q/k
+            print(f"Debug: v.shape[-1] = {v.shape[-1]}, self.num_heads = {self.num_heads}")
+            print(f"Debug: v.shape[-1] % self.num_heads = {v.shape[-1] % self.num_heads}")
+            
             if v.shape[-1] % self.num_heads == 0:
                 v_flash = v.view(b, n, self.num_heads, v_head_dim)
+                print(f"Debug: v_flash.shape = {v_flash.shape}")
             else:
                 # If v dimension doesn't divide evenly, we need to adjust
                 # Try to find a compatible number of heads for v
@@ -383,6 +379,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 
                 v_head_dim = v_total_dim // v_num_heads
                 v_flash = v.view(b, n, v_num_heads, v_head_dim)
+                print(f"Debug: v_flash.shape after initial reshape = {v_flash.shape}")
                 
                 # If we have fewer heads than expected, we need to repeat or pad
                 if v_num_heads < self.num_heads:
@@ -393,10 +390,15 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     if remainder > 0:
                         # Add remaining heads by repeating the first few heads
                         v_flash = torch.cat([v_flash, v_flash[:, :, :remainder, :]], dim=2)
+                    print(f"Debug: v_flash.shape after repeat = {v_flash.shape}")
                 
             # Reshape u for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
+            print(f"Debug: u.shape[-1] = {u.shape[-1]}, self.num_heads = {self.num_heads}")
+            print(f"Debug: u.shape[-1] % self.num_heads = {u.shape[-1] % self.num_heads}")
+            
             if u.shape[-1] % self.num_heads == 0:
                 u_flash = u.view(b, n, self.num_heads, u_head_dim)
+                print(f"Debug: u_flash.shape = {u_flash.shape}")
             else:
                 # If u dimension doesn't divide evenly, we need to adjust
                 # Try to find a compatible number of heads for u
@@ -409,6 +411,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 
                 u_head_dim = u_total_dim // u_num_heads
                 u_flash = u.view(b, n, u_num_heads, u_head_dim)
+                print(f"Debug: u_flash.shape after initial reshape = {u_flash.shape}")
                 
                 # If we have fewer heads than expected, we need to repeat or pad
                 if u_num_heads < self.num_heads:
@@ -419,6 +422,12 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     if remainder > 0:
                         # Add remaining heads by repeating the first few heads
                         u_flash = torch.cat([u_flash, u_flash[:, :, :remainder, :]], dim=2)
+                    print(f"Debug: u_flash.shape after repeat = {u_flash.shape}")
+            
+            # Ensure tensors are contiguous for FlashAttention
+            v_flash = v_flash.contiguous()
+            u_flash = u_flash.contiguous()
+            print(f"Debug: Final v_flash.shape = {v_flash.shape}, u_flash.shape = {u_flash.shape}")
             
             # Apply Flash Attention with multiple fallback options
             softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -460,29 +469,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     attn_out_v = attn_out_v.to(original_dtype_v)
                     attn_out_u = attn_out_u.to(original_dtype_u)
                     
-                # Use PyTorch native attention for Turing and older GPUs
-                elif TORCH_NATIVE_ATTN_AVAILABLE and scaled_dot_product_attention is not None:
-                    print("Using PyTorch native attention (optimized for Turing/older GPUs)")
-                    # PyTorch native attention for v
-                    attn_out_v = scaled_dot_product_attention(
-                        q_flash, k_flash, v_flash,
-                        attn_mask=None,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        is_causal=self.causal,
-                        scale=softmax_scale
-                    )
-                    
-                    # PyTorch native attention for u
-                    attn_out_u = scaled_dot_product_attention(
-                        q_flash, k_flash, u_flash,
-                        attn_mask=None,
-                        dropout_p=self.dropout.p if self.training else 0.0,
-                        is_causal=self.causal,
-                        scale=softmax_scale
-                    )
-                    
                 else:
-                    raise ValueError("No optimized attention available")
+                    raise ValueError("FlashAttention not available")
                     
             except Exception as e:
                 print(f"Optimized attention failed: {e}")
