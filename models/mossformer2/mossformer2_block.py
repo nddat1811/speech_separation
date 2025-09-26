@@ -356,25 +356,69 @@ class FLASH_ShareA_FFConvM(nn.Module):
             k_flash = quad_k.view(b, n, self.num_heads, head_dim)
             
             # Handle v and u with different dimensions
-            v_head_dim = v.shape[-1] // self.num_heads
-            u_head_dim = u.shape[-1] // self.num_heads
+            # FlashAttention expects: (batch_size, seqlen_k, num_heads_k, head_size)
+            # where num_heads_k should match the query num_heads for proper attention
+            
+            # Calculate head dimensions for v and u
+            v_head_dim = v.shape[-1] // self.num_heads if v.shape[-1] % self.num_heads == 0 else v.shape[-1]
+            u_head_dim = u.shape[-1] // self.num_heads if u.shape[-1] % self.num_heads == 0 else u.shape[-1]
             
             print(f"Debug: v_head_dim = {v_head_dim}, u_head_dim = {u_head_dim}")
             print(f"Debug: v.shape = {v.shape}, u.shape = {u.shape}")
+            print(f"Debug: num_heads = {self.num_heads}, v.shape[-1] = {v.shape[-1]}")
             
+            # Reshape v for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
+            # Ensure v has the same number of heads as q/k
             if v.shape[-1] % self.num_heads == 0:
                 v_flash = v.view(b, n, self.num_heads, v_head_dim)
             else:
-                # If v dimension doesn't match, use original v
-                v_flash = v.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
-                v_head_dim = v.shape[-1]
+                # If v dimension doesn't divide evenly, we need to adjust
+                # Try to find a compatible number of heads for v
+                v_total_dim = v.shape[-1]
+                # Find the largest divisor of v_total_dim that's <= self.num_heads
+                v_num_heads = 1
+                for i in range(1, min(self.num_heads, v_total_dim) + 1):
+                    if v_total_dim % i == 0:
+                        v_num_heads = i
                 
+                v_head_dim = v_total_dim // v_num_heads
+                v_flash = v.view(b, n, v_num_heads, v_head_dim)
+                
+                # If we have fewer heads than expected, we need to repeat or pad
+                if v_num_heads < self.num_heads:
+                    # Repeat the last head to match num_heads
+                    repeat_factor = self.num_heads // v_num_heads
+                    remainder = self.num_heads % v_num_heads
+                    v_flash = v_flash.repeat(1, 1, repeat_factor, 1)
+                    if remainder > 0:
+                        # Add remaining heads by repeating the first few heads
+                        v_flash = torch.cat([v_flash, v_flash[:, :, :remainder, :]], dim=2)
+                
+            # Reshape u for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
             if u.shape[-1] % self.num_heads == 0:
                 u_flash = u.view(b, n, self.num_heads, u_head_dim)
             else:
-                # If u dimension doesn't match, use original u
-                u_flash = u.unsqueeze(2).repeat(1, 1, self.num_heads, 1)
-                u_head_dim = u.shape[-1]
+                # If u dimension doesn't divide evenly, we need to adjust
+                # Try to find a compatible number of heads for u
+                u_total_dim = u.shape[-1]
+                # Find the largest divisor of u_total_dim that's <= self.num_heads
+                u_num_heads = 1
+                for i in range(1, min(self.num_heads, u_total_dim) + 1):
+                    if u_total_dim % i == 0:
+                        u_num_heads = i
+                
+                u_head_dim = u_total_dim // u_num_heads
+                u_flash = u.view(b, n, u_num_heads, u_head_dim)
+                
+                # If we have fewer heads than expected, we need to repeat or pad
+                if u_num_heads < self.num_heads:
+                    # Repeat the last head to match num_heads
+                    repeat_factor = self.num_heads // u_num_heads
+                    remainder = self.num_heads % u_num_heads
+                    u_flash = u_flash.repeat(1, 1, repeat_factor, 1)
+                    if remainder > 0:
+                        # Add remaining heads by repeating the first few heads
+                        u_flash = torch.cat([u_flash, u_flash[:, :, :remainder, :]], dim=2)
             
             # Apply Flash Attention with multiple fallback options
             softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -445,14 +489,37 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 raise e
             
             # Reshape back to original dimensions
-            if attn_out_v.shape[-1] == v_head_dim:
+            # FlashAttention output shape: (batch_size, seqlen_q, num_heads, head_size)
+            # We need to reshape to (batch_size, seqlen_q, total_features)
+            
+            print(f"Debug: attn_out_v.shape = {attn_out_v.shape}, attn_out_u.shape = {attn_out_u.shape}")
+            
+            # For v output - handle the case where we may have repeated heads
+            if attn_out_v.shape[-2] == self.num_heads:
+                # We have the expected number of heads, but may need to reduce if we repeated
+                if v.shape[-1] % self.num_heads != 0:
+                    # We repeated heads, so we need to take only the original heads
+                    v_num_heads = v.shape[-1] // (v.shape[-1] // self.num_heads) if v.shape[-1] // self.num_heads > 0 else 1
+                    attn_out_v = attn_out_v[:, :, :v_num_heads, :]
+                
+                # Reshape to original v dimensions
                 attn_out_v = attn_out_v.view(b, n, -1)
             else:
+                # Fallback: just flatten the last two dimensions
                 attn_out_v = attn_out_v.view(b, n, -1)
                 
-            if attn_out_u.shape[-1] == u_head_dim:
+            # For u output - handle the case where we may have repeated heads
+            if attn_out_u.shape[-2] == self.num_heads:
+                # We have the expected number of heads, but may need to reduce if we repeated
+                if u.shape[-1] % self.num_heads != 0:
+                    # We repeated heads, so we need to take only the original heads
+                    u_num_heads = u.shape[-1] // (u.shape[-1] // self.num_heads) if u.shape[-1] // self.num_heads > 0 else 1
+                    attn_out_u = attn_out_u[:, :, :u_num_heads, :]
+                
+                # Reshape to original u dimensions
                 attn_out_u = attn_out_u.view(b, n, -1)
             else:
+                # Fallback: just flatten the last two dimensions
                 attn_out_u = attn_out_u.view(b, n, -1)
             
             return attn_out_v, attn_out_u
