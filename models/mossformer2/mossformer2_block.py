@@ -312,163 +312,161 @@ class FLASH_ShareA_FFConvM(nn.Module):
             return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
     def cal_flash_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
-        """Flash Attention implementation for MossFormer2"""
+        """Flash Attention implementation for MossFormer2 with proper grouped attention"""
         try:
             b, n, device = x.shape[0], x.shape[-2], x.device
-            original_dtype_v = v.dtype
-            original_dtype_u = u.dtype
+            g = self.group_size
             
-            # Debug tensor shapes
-            # print(f"Debug: quad_q shape: {quad_q.shape}, v shape: {v.shape}")
-            # print(f"Debug: num_heads: {self.num_heads}, head_dim: {self.head_dim}")
+            # Apply grouped attention like original MossFormer2
+            # Pad sequence to multiple of group_size
+            padding = padding_to_multiple_of(n, g)
+            if padding > 0:
+                quad_q, quad_k, lin_q, lin_k, v, u = map(
+                    lambda t: F.pad(t, (0, 0, 0, padding), value=0.), 
+                    (quad_q, quad_k, lin_q, lin_k, v, u)
+                )
+                mask = default(mask, torch.ones((b, n), device=device, dtype=torch.bool))
+                mask = F.pad(mask, (0, padding), value=False)
             
-            # Use quad_q and quad_k for Flash Attention (simpler approach)
-            # Reshape for multi-head attention
-            head_dim = self.head_dim
+            # Group along sequence dimension
+            quad_q, quad_k, lin_q, lin_k, v, u = map(
+                lambda t: rearrange(t, 'b (g n) d -> b g n d', n=g), 
+                (quad_q, quad_k, lin_q, lin_k, v, u)
+            )
             
-            # Check if dimensions are compatible
-            expected_size = b * n * self.num_heads * head_dim
-            actual_size = quad_q.numel()
+            if exists(mask):
+                mask = rearrange(mask, 'b (g j) -> b g 1 j', j=g)
             
-            # print(f"Debug: expected_size = {expected_size}, actual_size = {actual_size}")
-            # print(f"Debug: quad_q.shape = {quad_q.shape}")
-            # print(f"Debug: b={b}, n={n}, num_heads={self.num_heads}, head_dim={head_dim}")
+            # Process each group with FlashAttention
+            attn_out_v_list = []
+            attn_out_u_list = []
             
-            if actual_size != expected_size:
-                print(f"Dimension mismatch: expected {expected_size}, got {actual_size}")
-                # Try to fix the dimension by adjusting head_dim
-                actual_head_dim = actual_size // (b * n * self.num_heads)
-                if actual_head_dim * b * n * self.num_heads == actual_size:
-                    print(f"Adjusted head_dim from {head_dim} to {actual_head_dim}")
-                    head_dim = actual_head_dim
-                else:
-                    raise ValueError(f"Tensor size mismatch: {actual_size} != {expected_size}")
-            
-            q_flash = quad_q.view(b, n, self.num_heads, head_dim)
-            k_flash = quad_k.view(b, n, self.num_heads, head_dim)
-            
-            # Handle v and u with different dimensions
-            # FlashAttention expects: (batch_size, seqlen_k, num_heads_k, head_size)
-            # where num_heads_k should match the query num_heads for proper attention
-            
-            # Calculate head dimensions for v and u
-            # FlashAttention requires all tensors to have the same head_size
-            # Use the same head_dim as query/key for consistency
-            v_head_dim = head_dim  # Use same head_dim as query
-            u_head_dim = head_dim  # Use same head_dim as query
-            
-            # Reshape v for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
-            # FlashAttention requires all tensors to have the same head_size
-            # We need to reshape v to have the same head_dim as query (8)
-            
-            # Calculate how many features we can fit per head with the same head_dim as query
-            features_per_head = v.shape[-1] // self.num_heads
-            if features_per_head >= head_dim:
-                # We can fit the features by taking the first head_dim features per head
-                v_reshaped = v.view(b, n, self.num_heads, features_per_head)
-                v_flash = v_reshaped[:, :, :, :head_dim]  # Take only first head_dim features
-            else:
-                # We need to pad or repeat features to match head_dim
-                v_reshaped = v.view(b, n, self.num_heads, features_per_head)
-                # Pad with zeros to reach head_dim
-                padding = head_dim - features_per_head
-                v_flash = F.pad(v_reshaped, (0, padding), value=0.0)
-            
-            # Reshape u for FlashAttention: (batch_size, seqlen_k, num_heads_k, head_size)
-            # FlashAttention requires all tensors to have the same head_size
-            # We need to reshape u to have the same head_dim as query (8)
-            
-            # Calculate how many features we can fit per head with the same head_dim as query
-            features_per_head = u.shape[-1] // self.num_heads
-            if features_per_head >= head_dim:
-                # We can fit the features by taking the first head_dim features per head
-                u_reshaped = u.view(b, n, self.num_heads, features_per_head)
-                u_flash = u_reshaped[:, :, :, :head_dim]  # Take only first head_dim features
-            else:
-                # We need to pad or repeat features to match head_dim
-                u_reshaped = u.view(b, n, self.num_heads, features_per_head)
-                # Pad with zeros to reach head_dim
-                padding = head_dim - features_per_head
-                u_flash = F.pad(u_reshaped, (0, padding), value=0.0)
-            
-            # Ensure tensors are contiguous for FlashAttention
-            v_flash = v_flash.contiguous()
-            u_flash = u_flash.contiguous()
-            
-            # Apply Flash Attention with multiple fallback options
-            softmax_scale = 1.0 / math.sqrt(head_dim)
-            
-            try:
-                # Check GPU architecture and choose appropriate attention
-                use_flash_attn = False
-                if torch.cuda.is_available():
-                    major, minor = torch.cuda.get_device_capability()
-                    # Flash Attention 2.x only supports Ampere (8.0+) and newer
-                    use_flash_attn = major >= 8
-                    # print(f"GPU SM {major}.{minor}: {'Ampere+ (Flash Attention supported)' if use_flash_attn else 'Turing or older (PyTorch native)'}")
+            for group_idx in range(quad_q.shape[1]):  # Iterate over groups
+                # Extract current group
+                q_group = quad_q[:, group_idx]  # (b, n, d)
+                k_group = quad_k[:, group_idx]  # (b, n, d)
+                v_group = v[:, group_idx]       # (b, n, d)
+                u_group = u[:, group_idx]       # (b, n, d)
                 
-                # Try Flash Attention for supported GPUs
-                if use_flash_attn and FLASH_ATTN_AVAILABLE and flash_attn_func is not None:
-                    # print("Using Flash Attention")
-                    # Ensure supported dtype for FlashAttention (fp16/bf16)
-                    attn_dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
-                    qf = q_flash.to(attn_dtype).contiguous()
-                    kf = k_flash.to(attn_dtype).contiguous()
-                    vf = v_flash.to(attn_dtype).contiguous()
-                    uf = u_flash.to(attn_dtype).contiguous()
+                # Reshape for FlashAttention with fixed head configuration
+                # Use 8 heads with 16 head_dim for optimal performance
+                num_heads = 8
+                head_dim = 16
+                
+                # Ensure dimensions are compatible
+                if q_group.shape[-1] % (num_heads * head_dim) == 0:
+                    # Reshape to (b, n, num_heads, head_dim)
+                    q_reshaped = q_group.view(b, g, num_heads, head_dim)
+                    k_reshaped = k_group.view(b, g, num_heads, head_dim)
+                    v_reshaped = v_group.view(b, g, num_heads, head_dim)
+                    u_reshaped = u_group.view(b, g, num_heads, head_dim)
+                else:
+                    # Pad to compatible size
+                    target_dim = num_heads * head_dim
+                    if q_group.shape[-1] < target_dim:
+                        pad_size = target_dim - q_group.shape[-1]
+                        q_reshaped = F.pad(q_group, (0, pad_size), value=0.0)
+                        k_reshaped = F.pad(k_group, (0, pad_size), value=0.0)
+                        v_reshaped = F.pad(v_group, (0, pad_size), value=0.0)
+                        u_reshaped = F.pad(u_group, (0, pad_size), value=0.0)
+                    else:
+                        # Truncate to target size
+                        q_reshaped = q_group[:, :, :target_dim]
+                        k_reshaped = k_group[:, :, :target_dim]
+                        v_reshaped = v_group[:, :, :target_dim]
+                        u_reshaped = u_group[:, :, :target_dim]
                     
-                    # Flash attention for v - use kf as key and vf as value
-                    attn_out_v = flash_attn_func(
+                    q_reshaped = q_reshaped.view(b, g, num_heads, head_dim)
+                    k_reshaped = k_reshaped.view(b, g, num_heads, head_dim)
+                    v_reshaped = v_reshaped.view(b, g, num_heads, head_dim)
+                    u_reshaped = u_reshaped.view(b, g, num_heads, head_dim)
+                
+                # Apply FlashAttention to current group
+                try:
+                    # Ensure supported dtype
+                    attn_dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
+                    qf = q_reshaped.to(attn_dtype).contiguous()
+                    kf = k_reshaped.to(attn_dtype).contiguous()
+                    vf = v_reshaped.to(attn_dtype).contiguous()
+                    uf = u_reshaped.to(attn_dtype).contiguous()
+                    
+                    softmax_scale = 1.0 / math.sqrt(head_dim)
+                    
+                    # FlashAttention for v
+                    attn_v = flash_attn_func(
                         qf, kf, vf,
                         dropout_p=self.dropout.p if self.training else 0.0,
                         softmax_scale=softmax_scale,
                         causal=self.causal
                     )
                     
-                    # Flash attention for u - use kf as key and uf as value
-                    attn_out_u = flash_attn_func(
+                    # FlashAttention for u
+                    attn_u = flash_attn_func(
                         qf, kf, uf,
                         dropout_p=self.dropout.p if self.training else 0.0,
                         softmax_scale=softmax_scale,
                         causal=self.causal
                     )
-                    # Cast back to original dtypes
-                    attn_out_v = attn_out_v.to(original_dtype_v)
-                    attn_out_u = attn_out_u.to(original_dtype_u)
                     
-                else:
-                    raise ValueError("FlashAttention not available")
+                    # Convert back to original dtype and reshape
+                    attn_v = attn_v.to(v_group.dtype).view(b, g, -1)
+                    attn_u = attn_u.to(u_group.dtype).view(b, g, -1)
                     
-            except Exception as e:
-                print(f"Optimized attention failed: {e}")
-                raise e
+                    # Restore original dimensions if needed
+                    if attn_v.shape[-1] != v_group.shape[-1]:
+                        if attn_v.shape[-1] < v_group.shape[-1]:
+                            # Pad
+                            pad_size = v_group.shape[-1] - attn_v.shape[-1]
+                            attn_v = F.pad(attn_v, (0, pad_size), value=0.0)
+                        else:
+                            # Truncate
+                            attn_v = attn_v[:, :, :v_group.shape[-1]]
+                    
+                    if attn_u.shape[-1] != u_group.shape[-1]:
+                        if attn_u.shape[-1] < u_group.shape[-1]:
+                            # Pad
+                            pad_size = u_group.shape[-1] - attn_u.shape[-1]
+                            attn_u = F.pad(attn_u, (0, pad_size), value=0.0)
+                        else:
+                            # Truncate
+                            attn_u = attn_u[:, :, :u_group.shape[-1]]
+                    
+                    attn_out_v_list.append(attn_v)
+                    attn_out_u_list.append(attn_u)
+                    
+                except Exception as e:
+                    # Fallback to standard attention for this group
+                    print(f"FlashAttention failed for group {group_idx}: {e}")
+                    # Use standard attention for this group
+                    sim = einsum('... i d, ... j d -> ... i j', q_group, k_group) / g
+                    attn = F.relu(sim) ** 2
+                    attn = self.dropout(attn)
+                    
+                    if exists(mask) and group_idx < mask.shape[1]:
+                        attn = attn.masked_fill(~mask[:, group_idx:group_idx+1], 0.)
+                    
+                    if self.causal:
+                        causal_mask = torch.ones((g, g), dtype=torch.bool, device=device).triu(1)
+                        attn = attn.masked_fill(causal_mask, 0.)
+                    
+                    attn_v = einsum('... i j, ... j d -> ... i d', attn, v_group)
+                    attn_u = einsum('... i j, ... j d -> ... i d', attn, u_group)
+                    
+                    attn_out_v_list.append(attn_v)
+                    attn_out_u_list.append(attn_u)
             
-            # Reshape back to original dimensions
-            # FlashAttention output shape: (batch_size, seqlen_q, num_heads, head_size)
-            # We need to reshape to (batch_size, seqlen_q, total_features)
+            # Concatenate all groups back
+            attn_out_v = torch.cat(attn_out_v_list, dim=1)  # (b, g*n, d)
+            attn_out_u = torch.cat(attn_out_u_list, dim=1)  # (b, g*n, d)
             
-            # For v output - we need to restore the original v dimensions
-            # Since we cut features to match head_dim, we need to pad back to original size
-            attn_out_v = attn_out_v.view(b, n, -1)  # Flatten to (b, n, num_heads * head_dim)
-            
-            # Pad back to original v dimensions if needed
-            if attn_out_v.shape[-1] < v.shape[-1]:
-                padding = v.shape[-1] - attn_out_v.shape[-1]
-                attn_out_v = F.pad(attn_out_v, (0, padding), value=0.0)
-            
-            # For u output - we need to restore the original u dimensions  
-            attn_out_u = attn_out_u.view(b, n, -1)  # Flatten to (b, n, num_heads * head_dim)
-            
-            # Pad back to original u dimensions if needed
-            if attn_out_u.shape[-1] < u.shape[-1]:
-                padding = u.shape[-1] - attn_out_u.shape[-1]
-                attn_out_u = F.pad(attn_out_u, (0, padding), value=0.0)
+            # Remove padding
+            attn_out_v = attn_out_v[:, :n]
+            attn_out_u = attn_out_u[:, :n]
             
             return attn_out_v, attn_out_u
             
         except Exception as e:
             print(f"Flash Attention failed: {e}")
-            # print("Falling back to standard attention...")
             return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
     def cal_standard_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
@@ -688,7 +686,7 @@ class MossformerBlock_GFSMN(nn.Module):
             norm_klass = ScaleNorm
         elif norm_type == 'layernorm':
             norm_klass = nn.LayerNorm
-
+ 
         self.group_size = group_size
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
