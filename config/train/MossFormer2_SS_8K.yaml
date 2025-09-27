@@ -13,8 +13,8 @@ num_mossformer_layer: 24
 
 # Train
 load_type: 'one_input_multi_outputs'
-tr_list: '/kaggle/working/speech_separation/data/train_MiniLibri_clean.scp'
-cv_list: '/kaggle/working/speech_separation/data/val_MiniLibri_clean.scp'
+tr_list: '/home/speech_separation/scpfile/train_MiniLibri_clean.scp'
+cv_list: '/home/speech_separation/scpfile/val_MiniLibri_clean.scp'
 
 init_learning_rate: 0.00015 #learning rate for a new training
 finetune_learning_rate: 0.00005 #learning rate for a finetune training

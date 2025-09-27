@@ -1,17 +1,16 @@
 import os, glob
 from pathlib import Path
 
-# đổi tên folder 
 # ---- cấu hình ----
-ROOT = "/kaggle/input/minilibrimix/MiniLibriMix"
-USE_POSIX = True   # giữ True để luôn ra đường dẫn dạng "/" (hợp Linux/Colab)
+ROOT = "/home/speech_separation/MiniLibriMix"   # thư mục dataset đã giải nén
+USE_POSIX = True   # giữ True để luôn ra đường dẫn dạng "/" (Linux/Colab)
 
 # Tạo tất cả splits trong một lần chạy
 splits = ["train", "val", "test"]
 
 # ---- thư mục output ----
-out_dir = Path("/kaggle/working/speech_separation/data") #PATH ĐỔI PATH NẾU CẦN
-out_dir.mkdir(parents=True, exist_ok=True)   # tạo nếu chưa có
+out_dir = Path("/home/speech_separation/scpfile")  # <--- xuất ra đây
+out_dir.mkdir(parents=True, exist_ok=True)         # tạo nếu chưa có
 
 # ---- hàm tiện ích ----
 def list_wavs(d: Path):
