@@ -17,12 +17,22 @@ from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm,
 
 # Import Flash Attention functions
 try:
-    from flash_attn import flash_attn_func
+    from flash_attn import (
+        flash_attn_func, 
+        flash_attn_qkvpacked_func,
+        flash_attn_kvpacked_func,
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache
+    )
     FLASH_ATTN_AVAILABLE = True
-    print("Flash Attention available")
+    print("Flash Attention available with full feature set")
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
     flash_attn_func = None
+    flash_attn_qkvpacked_func = None
+    flash_attn_kvpacked_func = None
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
     print("Warning: Flash Attention not available. Using PyTorch native attention.")
 
 # functions
@@ -192,7 +202,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
         rotary_pos_emb = None,
         norm_klass = nn.LayerNorm,
         shift_tokens = True,
-        use_flash_attn = True
+        use_flash_attn = True,
+        flash_attn_config = None
     ):
         super().__init__()
         hidden_dim = int(dim * expansion_factor)        
@@ -200,6 +211,16 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.causal = causal
         self.shift_tokens = shift_tokens
         self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
+        
+        # Flash Attention configuration with enhanced defaults
+        self.flash_attn_config = flash_attn_config or {}
+        self.use_qkv_packed = self.flash_attn_config.get('use_qkv_packed', True)
+        self.use_alibi = self.flash_attn_config.get('use_alibi', True)  # Enable ALiBi by default
+        self.use_sliding_window = self.flash_attn_config.get('use_sliding_window', True)  # Enable sliding window by default
+        self.window_size = self.flash_attn_config.get('window_size', (64, 64))  # Default window size
+        self.use_softcap = self.flash_attn_config.get('use_softcap', True)  # Enable softcap by default
+        self.softcap_value = self.flash_attn_config.get('softcap_value', 0.1)  # Default softcap value
+        self.deterministic = self.flash_attn_config.get('deterministic', False)
 
         # positional embeddings
         self.rotary_pos_emb = rotary_pos_emb
@@ -241,6 +262,29 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     self.num_heads = i
             
             self.head_dim = query_key_dim // self.num_heads
+            
+            # ALiBi slopes for positional bias
+            if self.use_alibi:
+                self.alibi_slopes = self._get_alibi_slopes(self.num_heads)
+            else:
+                self.alibi_slopes = None
+
+    def _get_alibi_slopes(self, num_heads):
+        """Generate ALiBi slopes for positional bias"""
+        def get_slopes(heads):
+            def get_slopes_power_of_2(n):
+                start = (2**(-2**-(math.log2(n)-3)))
+                ratio = start
+                return [start*ratio**i for i in range(n)]
+            
+            if math.log2(heads).is_integer():
+                return get_slopes_power_of_2(heads)
+            else:
+                closest_power_of_2 = 2**math.floor(math.log2(heads))
+                return get_slopes_power_of_2(closest_power_of_2) + get_slopes(2*closest_power_of_2)[0::2][:heads-closest_power_of_2]
+        
+        slopes = get_slopes(num_heads)
+        return torch.tensor(slopes, dtype=torch.float32)
 
     def forward(
         self,
@@ -312,7 +356,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
             return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
     def cal_flash_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
-        """Flash Attention implementation for MossFormer2 with proper grouped attention"""
+        """Enhanced Flash Attention implementation for MossFormer2 with advanced features"""
         try:
             b, n, device = x.shape[0], x.shape[-2], x.device
             g = self.group_size
@@ -337,7 +381,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
             if exists(mask):
                 mask = rearrange(mask, 'b (g j) -> b g 1 j', j=g)
             
-            # Process each group with FlashAttention
+            # Process each group with enhanced FlashAttention
             attn_out_v_list = []
             attn_out_u_list = []
             
@@ -348,10 +392,9 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 v_group = v[:, group_idx]       # (b, n, d)
                 u_group = u[:, group_idx]       # (b, n, d)
                 
-                # Reshape for FlashAttention with fixed head configuration
-                # Use 8 heads with 16 head_dim for optimal performance
-                num_heads = 8
-                head_dim = 16
+                # Reshape for FlashAttention with dynamic head configuration
+                num_heads = self.num_heads
+                head_dim = self.head_dim
                 
                 # Ensure dimensions are compatible
                 if q_group.shape[-1] % (num_heads * head_dim) == 0:
@@ -381,7 +424,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     v_reshaped = v_reshaped.view(b, g, num_heads, head_dim)
                     u_reshaped = u_reshaped.view(b, g, num_heads, head_dim)
                 
-                # Apply FlashAttention to current group
+                # Apply enhanced FlashAttention to current group
                 try:
                     # Ensure supported dtype
                     attn_dtype = torch.bfloat16 if getattr(torch.cuda, 'is_bf16_supported', lambda: False)() else torch.float16
@@ -392,20 +435,43 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     
                     softmax_scale = 1.0 / math.sqrt(head_dim)
                     
-                    # FlashAttention for v
+                    # Prepare ALiBi slopes if enabled
+                    alibi_slopes = None
+                    if self.use_alibi and self.alibi_slopes is not None:
+                        alibi_slopes = self.alibi_slopes.to(device)
+                    
+                    # Prepare window size
+                    window_size = (-1, -1)
+                    if self.use_sliding_window:
+                        window_size = self.window_size
+                    
+                    # Prepare softcap
+                    softcap = 0.0
+                    if self.use_softcap:
+                        softcap = self.softcap_value
+                    
+                    # Enhanced FlashAttention for v with all features
                     attn_v = flash_attn_func(
                         qf, kf, vf,
                         dropout_p=self.dropout.p if self.training else 0.0,
                         softmax_scale=softmax_scale,
-                        causal=self.causal
+                        causal=self.causal,
+                        window_size=window_size,
+                        softcap=softcap,
+                        alibi_slopes=alibi_slopes,
+                        deterministic=self.deterministic
                     )
                     
-                    # FlashAttention for u
+                    # Enhanced FlashAttention for u with all features
                     attn_u = flash_attn_func(
                         qf, kf, uf,
                         dropout_p=self.dropout.p if self.training else 0.0,
                         softmax_scale=softmax_scale,
-                        causal=self.causal
+                        causal=self.causal,
+                        window_size=window_size,
+                        softcap=softcap,
+                        alibi_slopes=alibi_slopes,
+                        deterministic=self.deterministic
                     )
                     
                     # Convert back to original dtype and reshape
@@ -436,7 +502,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     
                 except Exception as e:
                     # Fallback to standard attention for this group
-                    print(f"FlashAttention failed for group {group_idx}: {e}")
+                    print(f"Enhanced FlashAttention failed for group {group_idx}: {e}")
                     # Use standard attention for this group
                     sim = einsum('... i d, ... j d -> ... i j', q_group, k_group) / g
                     attn = F.relu(sim) ** 2
@@ -466,7 +532,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
             return attn_out_v, attn_out_u
             
         except Exception as e:
-            print(f"Flash Attention failed: {e}")
+            print(f"Enhanced Flash Attention failed: {e}")
             return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
 
     def cal_standard_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
@@ -677,7 +743,8 @@ class MossformerBlock_GFSMN(nn.Module):
         causal = False,
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
-        shift_tokens = True
+        shift_tokens = True,
+        flash_attn_config = None
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -691,8 +758,24 @@ class MossformerBlock_GFSMN(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
+        
+        # Enhanced Flash Attention configuration for better performance
+        enhanced_flash_config = {
+            'use_qkv_packed': True,
+            'use_alibi': True,  # Enable ALiBi for better positional encoding
+            'use_sliding_window': True,  # Enable sliding window for local attention
+            'window_size': (64, 64),  # 64 tokens left and right
+            'use_softcap': True,  # Enable softcapping for attention scores
+            'softcap_value': 0.1,  # Softcap value
+            'deterministic': False
+        }
+        
+        # Merge with user config if provided
+        if flash_attn_config:
+            enhanced_flash_config.update(flash_attn_config)
+        
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True) for _ in range(depth)])
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True, flash_attn_config = enhanced_flash_config) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -726,7 +809,8 @@ class MossformerBlock(nn.Module):
         causal = False,
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
-        shift_tokens = True
+        shift_tokens = True,
+        flash_attn_config = None
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -740,7 +824,23 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True) for _ in range(depth)])
+        
+        # Enhanced Flash Attention configuration for better performance
+        enhanced_flash_config = {
+            'use_qkv_packed': True,
+            'use_alibi': True,  # Enable ALiBi for better positional encoding
+            'use_sliding_window': True,  # Enable sliding window for local attention
+            'window_size': (64, 64),  # 64 tokens left and right
+            'use_softcap': True,  # Enable softcapping for attention scores
+            'softcap_value': 0.1,  # Softcap value
+            'deterministic': False
+        }
+        
+        # Merge with user config if provided
+        if flash_attn_config:
+            enhanced_flash_config.update(flash_attn_config)
+        
+        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True, flash_attn_config = enhanced_flash_config) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -760,3 +860,125 @@ class MossformerBlock(nn.Module):
             x = flash(x, mask = mask)
             ii = ii + 1
         return x
+
+# Example usage with enhanced Flash Attention configuration
+def create_enhanced_mossformer_block(
+    dim=512,
+    depth=6,
+    group_size=256,
+    query_key_dim=128,
+    use_alibi=True,
+    use_sliding_window=False,
+    use_softcap=False,
+    **kwargs
+):
+    """
+    Create MossFormer2 block with enhanced Flash Attention features
+    
+    Args:
+        dim: Model dimension
+        depth: Number of layers
+        group_size: Group size for attention
+        query_key_dim: Query/Key dimension
+        use_alibi: Enable ALiBi positional bias
+        use_sliding_window: Enable sliding window attention
+        use_softcap: Enable softcapping
+        **kwargs: Additional arguments
+    """
+    
+    # Enhanced Flash Attention configuration
+    flash_attn_config = {
+        'use_qkv_packed': True,
+        'use_alibi': use_alibi,
+        'use_sliding_window': use_sliding_window,
+        'window_size': (64, 64) if use_sliding_window else (-1, -1),
+        'use_softcap': use_softcap,
+        'softcap_value': 0.1 if use_softcap else 0.0,
+        'deterministic': False
+    }
+    
+    return MossformerBlock(
+        dim=dim,
+        depth=depth,
+        group_size=group_size,
+        query_key_dim=query_key_dim,
+        flash_attn_config=flash_attn_config,
+        **kwargs
+    )
+
+# Example usage:
+# model = create_enhanced_mossformer_block(
+#     dim=512,
+#     depth=6,
+#     use_alibi=True,
+#     use_sliding_window=True,
+#     use_softcap=True
+# )
+
+# Optimized Flash Attention configurations for different use cases
+def get_optimized_flash_config(use_case='default'):
+    """
+    Get optimized Flash Attention configuration for different use cases
+    
+    Args:
+        use_case: 'default', 'long_sequence', 'inference', 'training'
+    
+    Returns:
+        dict: Optimized configuration
+    """
+    configs = {
+        'default': {
+            'use_qkv_packed': True,
+            'use_alibi': True,
+            'use_sliding_window': True,
+            'window_size': (64, 64),
+            'use_softcap': True,
+            'softcap_value': 0.1,
+            'deterministic': False
+        },
+        'long_sequence': {
+            'use_qkv_packed': True,
+            'use_alibi': True,
+            'use_sliding_window': True,
+            'window_size': (128, 128),  # Larger window for long sequences
+            'use_softcap': True,
+            'softcap_value': 0.05,  # Lower softcap for long sequences
+            'deterministic': False
+        },
+        'inference': {
+            'use_qkv_packed': True,
+            'use_alibi': True,
+            'use_sliding_window': False,  # No sliding window for inference
+            'window_size': (-1, -1),
+            'use_softcap': False,  # No softcap for inference
+            'softcap_value': 0.0,
+            'deterministic': True  # Deterministic for inference
+        },
+        'training': {
+            'use_qkv_packed': True,
+            'use_alibi': True,
+            'use_sliding_window': True,
+            'window_size': (32, 32),  # Smaller window for training
+            'use_softcap': True,
+            'softcap_value': 0.15,  # Higher softcap for training
+            'deterministic': False
+        }
+    }
+    
+    return configs.get(use_case, configs['default'])
+
+# Quick setup functions for common scenarios
+def create_mossformer_for_long_sequences(dim=512, depth=6, **kwargs):
+    """Create MossFormer2 optimized for long sequences"""
+    config = get_optimized_flash_config('long_sequence')
+    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
+
+def create_mossformer_for_inference(dim=512, depth=6, **kwargs):
+    """Create MossFormer2 optimized for inference"""
+    config = get_optimized_flash_config('inference')
+    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
+
+def create_mossformer_for_training(dim=512, depth=6, **kwargs):
+    """Create MossFormer2 optimized for training"""
+    config = get_optimized_flash_config('training')
+    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
