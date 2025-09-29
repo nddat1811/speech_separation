@@ -263,6 +263,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
             
             self.head_dim = query_key_dim // self.num_heads
             
+            # No extra params: we'll slice/pad V/U at runtime to match Q/K dim for FlashAttention
+            
             # ALiBi slopes for positional bias
             if self.use_alibi:
                 self.alibi_slopes = self._get_alibi_slopes(self.num_heads)
@@ -360,22 +362,41 @@ class FLASH_ShareA_FFConvM(nn.Module):
         try:
             b, n, device = x.shape[0], x.shape[-2], x.device
             g = self.group_size
+            # Keep originals for safe fallback (ungrouped)
+            quad_q_orig, lin_q_orig, quad_k_orig, lin_k_orig = quad_q, lin_q, quad_k, lin_k
+            v_orig, u_orig = v, u
+            
+            # Prepare copies for FlashAttention (slice/pad to match Q/K dim; no params added)
+            if self.use_flash_attn:
+                qkv_dim = quad_q.shape[-1]
+                v_dim = v.shape[-1]
+                if v_dim == qkv_dim:
+                    v_att, u_att = v, u
+                elif v_dim > qkv_dim:
+                    v_att = v[..., :qkv_dim]
+                    u_att = u[..., :qkv_dim]
+                else:
+                    pad = qkv_dim - v_dim
+                    v_att = F.pad(v, (0, pad), value=0.0)
+                    u_att = F.pad(u, (0, pad), value=0.0)
+            else:
+                v_att, u_att = v, u
             
             # Apply grouped attention like original MossFormer2
             # Pad sequence to multiple of group_size
             padding = padding_to_multiple_of(n, g)
             if padding > 0:
-                quad_q, quad_k, lin_q, lin_k, v, u = map(
+                quad_q, quad_k, lin_q, lin_k, v_att, u_att = map(
                     lambda t: F.pad(t, (0, 0, 0, padding), value=0.), 
-                    (quad_q, quad_k, lin_q, lin_k, v, u)
+                    (quad_q, quad_k, lin_q, lin_k, v_att, u_att)
                 )
                 mask = default(mask, torch.ones((b, n), device=device, dtype=torch.bool))
                 mask = F.pad(mask, (0, padding), value=False)
             
             # Group along sequence dimension
-            quad_q, quad_k, lin_q, lin_k, v, u = map(
+            quad_q, quad_k, lin_q, lin_k, v_att, u_att = map(
                 lambda t: rearrange(t, 'b (g n) d -> b g n d', n=g), 
-                (quad_q, quad_k, lin_q, lin_k, v, u)
+                (quad_q, quad_k, lin_q, lin_k, v_att, u_att)
             )
             
             if exists(mask):
@@ -389,8 +410,11 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 # Extract current group
                 q_group = quad_q[:, group_idx]  # (b, n, d)
                 k_group = quad_k[:, group_idx]  # (b, n, d)
-                v_group = v[:, group_idx]       # (b, n, d)
-                u_group = u[:, group_idx]       # (b, n, d)
+                v_group = v_att[:, group_idx]       # (b, n, d)
+                u_group = u_att[:, group_idx]       # (b, n, d)
+                # Corresponding original dims for gating
+                v_orig_group = v_orig[:, group_idx]
+                u_orig_group = u_orig[:, group_idx]
                 
                 # Reshape for FlashAttention with dynamic head configuration
                 num_heads = self.num_heads
@@ -398,11 +422,12 @@ class FLASH_ShareA_FFConvM(nn.Module):
                 
                 # Ensure dimensions are compatible
                 if q_group.shape[-1] % (num_heads * head_dim) == 0:
-                    # Reshape to (b, n, num_heads, head_dim)
-                    q_reshaped = q_group.view(b, g, num_heads, head_dim)
-                    k_reshaped = k_group.view(b, g, num_heads, head_dim)
-                    v_reshaped = v_group.view(b, g, num_heads, head_dim)
-                    u_reshaped = u_group.view(b, g, num_heads, head_dim)
+                    # Reshape to (b, n_per_group, num_heads, head_dim)
+                    n_per_group = q_group.shape[1]
+                    q_reshaped = q_group.view(b, n_per_group, num_heads, head_dim)
+                    k_reshaped = k_group.view(b, n_per_group, num_heads, head_dim)
+                    v_reshaped = v_group.view(b, n_per_group, num_heads, head_dim)
+                    u_reshaped = u_group.view(b, n_per_group, num_heads, head_dim)
                 else:
                     # Pad to compatible size
                     target_dim = num_heads * head_dim
@@ -419,10 +444,11 @@ class FLASH_ShareA_FFConvM(nn.Module):
                         v_reshaped = v_group[:, :, :target_dim]
                         u_reshaped = u_group[:, :, :target_dim]
                     
-                    q_reshaped = q_reshaped.view(b, g, num_heads, head_dim)
-                    k_reshaped = k_reshaped.view(b, g, num_heads, head_dim)
-                    v_reshaped = v_reshaped.view(b, g, num_heads, head_dim)
-                    u_reshaped = u_reshaped.view(b, g, num_heads, head_dim)
+                    n_per_group = q_reshaped.shape[1]
+                    q_reshaped = q_reshaped.view(b, n_per_group, num_heads, head_dim)
+                    k_reshaped = k_reshaped.view(b, n_per_group, num_heads, head_dim)
+                    v_reshaped = v_reshaped.view(b, n_per_group, num_heads, head_dim)
+                    u_reshaped = u_reshaped.view(b, n_per_group, num_heads, head_dim)
                 
                 # Apply enhanced FlashAttention to current group
                 try:
@@ -445,9 +471,9 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     if self.use_sliding_window:
                         window_size = self.window_size
                     
-                    # Prepare softcap
+                    # Prepare softcap (disable when dropout>0, unsupported)
                     softcap = 0.0
-                    if self.use_softcap:
+                    if self.use_softcap and not bool(self.training and (self.dropout.p > 0.0)):
                         softcap = self.softcap_value
                     
                     # Enhanced FlashAttention for v with all features
@@ -475,27 +501,23 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     )
                     
                     # Convert back to original dtype and reshape
-                    attn_v = attn_v.to(v_group.dtype).view(b, g, -1)
-                    attn_u = attn_u.to(u_group.dtype).view(b, g, -1)
+                    attn_v = attn_v.to(v_group.dtype).view(b, n_per_group, -1)
+                    attn_u = attn_u.to(u_group.dtype).view(b, n_per_group, -1)
                     
-                    # Restore original dimensions if needed
-                    if attn_v.shape[-1] != v_group.shape[-1]:
-                        if attn_v.shape[-1] < v_group.shape[-1]:
-                            # Pad
-                            pad_size = v_group.shape[-1] - attn_v.shape[-1]
+                    # Ensure attention outputs match original v/u dims for gating
+                    if attn_v.shape[-1] != v_orig_group.shape[-1]:
+                        if attn_v.shape[-1] < v_orig_group.shape[-1]:
+                            pad_size = v_orig_group.shape[-1] - attn_v.shape[-1]
                             attn_v = F.pad(attn_v, (0, pad_size), value=0.0)
                         else:
-                            # Truncate
-                            attn_v = attn_v[:, :, :v_group.shape[-1]]
+                            attn_v = attn_v[:, :, :v_orig_group.shape[-1]]
                     
-                    if attn_u.shape[-1] != u_group.shape[-1]:
-                        if attn_u.shape[-1] < u_group.shape[-1]:
-                            # Pad
-                            pad_size = u_group.shape[-1] - attn_u.shape[-1]
+                    if attn_u.shape[-1] != u_orig_group.shape[-1]:
+                        if attn_u.shape[-1] < u_orig_group.shape[-1]:
+                            pad_size = u_orig_group.shape[-1] - attn_u.shape[-1]
                             attn_u = F.pad(attn_u, (0, pad_size), value=0.0)
                         else:
-                            # Truncate
-                            attn_u = attn_u[:, :, :u_group.shape[-1]]
+                            attn_u = attn_u[:, :, :u_orig_group.shape[-1]]
                     
                     attn_out_v_list.append(attn_v)
                     attn_out_u_list.append(attn_u)
@@ -522,8 +544,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     attn_out_u_list.append(attn_u)
             
             # Concatenate all groups back
-            attn_out_v = torch.cat(attn_out_v_list, dim=1)  # (b, g*n, d)
-            attn_out_u = torch.cat(attn_out_u_list, dim=1)  # (b, g*n, d)
+            attn_out_v = torch.cat(attn_out_v_list, dim=1)  # (b, n, d)
+            attn_out_u = torch.cat(attn_out_u_list, dim=1)  # (b, n, d)
             
             # Remove padding
             attn_out_v = attn_out_v[:, :n]
@@ -533,7 +555,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
             
         except Exception as e:
             print(f"Enhanced Flash Attention failed: {e}")
-            return self.cal_standard_attention(x, quad_q, lin_q, quad_k, lin_k, v, u, mask)
+            # Fallback with ungrouped original tensors
+            return self.cal_standard_attention(x, quad_q_orig, lin_q_orig, quad_k_orig, lin_k_orig, v_orig, u_orig, mask)
 
     def cal_standard_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask = None):
         """Original MossFormer2 attention implementation"""
