@@ -203,7 +203,8 @@ class FLASH_ShareA_FFConvM(nn.Module):
         norm_klass = nn.LayerNorm,
         shift_tokens = True,
         use_flash_attn = True,
-        flash_attn_config = None
+        flash_attn_config = None,
+        debug_fa: bool = True
     ):
         super().__init__()
         hidden_dim = int(dim * expansion_factor)        
@@ -211,6 +212,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
         self.causal = causal
         self.shift_tokens = shift_tokens
         self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
+        self.debug_fa = debug_fa
         
         # Flash Attention configuration with enhanced defaults
         self.flash_attn_config = flash_attn_config or {}
@@ -360,6 +362,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
     def cal_flash_attention(self, x, quad_q, lin_q, quad_k, lin_k, v, u, mask=None):
         """Enhanced Flash Attention implementation for MossFormer2 with advanced features"""
         try:
+            import time
             b, n, device = x.shape[0], x.shape[-2], x.device
             g = self.group_size
             # Keep originals for safe fallback (ungrouped)
@@ -384,6 +387,13 @@ class FLASH_ShareA_FFConvM(nn.Module):
             
             # Apply grouped attention like original MossFormer2
             # Pad sequence to multiple of group_size
+            # timers/counters
+            def _sync():
+                if x.is_cuda:
+                    torch.cuda.synchronize(device)
+            t0_total = time.perf_counter(); _sync()
+            fa_ok, fa_fb = 0, 0
+            fa_kernel_ms = 0.0
             padding = padding_to_multiple_of(n, g)
             if padding > 0:
                 quad_q, quad_k, lin_q, lin_k, v_att, u_att = map(
@@ -477,6 +487,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                         softcap = self.softcap_value
                     
                     # Enhanced FlashAttention for v with all features
+                    t1 = time.perf_counter(); _sync()
                     attn_v = flash_attn_func(
                         qf, kf, vf,
                         dropout_p=self.dropout.p if self.training else 0.0,
@@ -487,8 +498,10 @@ class FLASH_ShareA_FFConvM(nn.Module):
                         alibi_slopes=alibi_slopes,
                         deterministic=self.deterministic
                     )
+                    _sync(); t2 = time.perf_counter(); fa_kernel_ms += (t2 - t1) * 1000.0
                     
                     # Enhanced FlashAttention for u with all features
+                    t3 = time.perf_counter(); _sync()
                     attn_u = flash_attn_func(
                         qf, kf, uf,
                         dropout_p=self.dropout.p if self.training else 0.0,
@@ -499,6 +512,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                         alibi_slopes=alibi_slopes,
                         deterministic=self.deterministic
                     )
+                    _sync(); t4 = time.perf_counter(); fa_kernel_ms += (t4 - t3) * 1000.0
                     
                     # Convert back to original dtype and reshape
                     attn_v = attn_v.to(v_group.dtype).view(b, n_per_group, -1)
@@ -521,6 +535,7 @@ class FLASH_ShareA_FFConvM(nn.Module):
                     
                     attn_out_v_list.append(attn_v)
                     attn_out_u_list.append(attn_u)
+                    fa_ok += 1
                     
                 except Exception as e:
                     # Fallback to standard attention for this group
@@ -551,6 +566,11 @@ class FLASH_ShareA_FFConvM(nn.Module):
             attn_out_v = attn_out_v[:, :n]
             attn_out_u = attn_out_u[:, :n]
             
+            _sync(); t_end = time.perf_counter()
+            if getattr(self, 'debug_fa', False):
+                total_ms = (t_end - t0_total) * 1000.0
+                print(f"[FA] groups={quad_q.shape[1]} ok={fa_ok} fb={fa_fb} fa_kernel_ms={fa_kernel_ms:.3f} total_ms={total_ms:.3f}")
+
             return attn_out_v, attn_out_u
             
         except Exception as e:
@@ -928,80 +948,3 @@ def create_enhanced_mossformer_block(
         flash_attn_config=flash_attn_config,
         **kwargs
     )
-
-# Example usage:
-# model = create_enhanced_mossformer_block(
-#     dim=512,
-#     depth=6,
-#     use_alibi=True,
-#     use_sliding_window=True,
-#     use_softcap=True
-# )
-
-# Optimized Flash Attention configurations for different use cases
-def get_optimized_flash_config(use_case='default'):
-    """
-    Get optimized Flash Attention configuration for different use cases
-    
-    Args:
-        use_case: 'default', 'long_sequence', 'inference', 'training'
-    
-    Returns:
-        dict: Optimized configuration
-    """
-    configs = {
-        'default': {
-            'use_qkv_packed': True,
-            'use_alibi': True,
-            'use_sliding_window': True,
-            'window_size': (64, 64),
-            'use_softcap': True,
-            'softcap_value': 0.1,
-            'deterministic': False
-        },
-        'long_sequence': {
-            'use_qkv_packed': True,
-            'use_alibi': True,
-            'use_sliding_window': True,
-            'window_size': (128, 128),  # Larger window for long sequences
-            'use_softcap': True,
-            'softcap_value': 0.05,  # Lower softcap for long sequences
-            'deterministic': False
-        },
-        'inference': {
-            'use_qkv_packed': True,
-            'use_alibi': True,
-            'use_sliding_window': False,  # No sliding window for inference
-            'window_size': (-1, -1),
-            'use_softcap': False,  # No softcap for inference
-            'softcap_value': 0.0,
-            'deterministic': True  # Deterministic for inference
-        },
-        'training': {
-            'use_qkv_packed': True,
-            'use_alibi': True,
-            'use_sliding_window': True,
-            'window_size': (32, 32),  # Smaller window for training
-            'use_softcap': True,
-            'softcap_value': 0.15,  # Higher softcap for training
-            'deterministic': False
-        }
-    }
-    
-    return configs.get(use_case, configs['default'])
-
-# Quick setup functions for common scenarios
-def create_mossformer_for_long_sequences(dim=512, depth=6, **kwargs):
-    """Create MossFormer2 optimized for long sequences"""
-    config = get_optimized_flash_config('long_sequence')
-    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
-
-def create_mossformer_for_inference(dim=512, depth=6, **kwargs):
-    """Create MossFormer2 optimized for inference"""
-    config = get_optimized_flash_config('inference')
-    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
-
-def create_mossformer_for_training(dim=512, depth=6, **kwargs):
-    """Create MossFormer2 optimized for training"""
-    config = get_optimized_flash_config('training')
-    return MossformerBlock(dim=dim, depth=depth, flash_attn_config=config, **kwargs)
