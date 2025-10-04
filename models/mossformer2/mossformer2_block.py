@@ -774,6 +774,239 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+class DenoiseLayer(nn.Module):
+    """Denoise layer for noise reduction in MossFormer2 architecture.
+    
+    This layer is designed to be inserted within the Repeat R times loop
+    to improve training with noisy data by applying noise reduction techniques.
+    
+    Arguments
+    ---------
+    dim : int
+        Input/output dimension
+    inner_channels : int
+        Inner channel dimension for processing
+    dropout : float
+        Dropout rate for regularization
+    use_spectral_subtraction : bool
+        Whether to use spectral subtraction for noise reduction
+    use_wiener_filter : bool
+        Whether to use Wiener filtering approach
+    """
+    
+    def __init__(
+        self,
+        dim,
+        inner_channels=256,
+        dropout=0.1,
+        use_spectral_subtraction=True,
+        use_wiener_filter=True,
+        norm_type='scalenorm'
+    ):
+        super(DenoiseLayer, self).__init__()
+        
+        if norm_type == 'scalenorm':
+            norm_klass = ScaleNorm
+        elif norm_type == 'layernorm':
+            norm_klass = nn.LayerNorm
+        else:
+            norm_klass = nn.LayerNorm
+            
+        self.dim = dim
+        self.inner_channels = inner_channels
+        self.use_spectral_subtraction = use_spectral_subtraction
+        self.use_wiener_filter = use_wiener_filter
+        
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(dim, inner_channels),
+            norm_klass(inner_channels),
+            nn.PReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Noise estimation branch
+        self.noise_estimator = nn.Sequential(
+            nn.Linear(inner_channels, inner_channels // 2),
+            norm_klass(inner_channels // 2),
+            nn.PReLU(),
+            nn.Linear(inner_channels // 2, inner_channels),
+            nn.Sigmoid()
+        )
+        
+        # Spectral subtraction module
+        if self.use_spectral_subtraction:
+            self.spectral_subtraction = nn.Sequential(
+                nn.Linear(inner_channels, inner_channels),
+                norm_klass(inner_channels),
+                nn.PReLU(),
+                nn.Linear(inner_channels, inner_channels),
+                nn.Sigmoid()
+            )
+        
+        # Wiener filter module
+        if self.use_wiener_filter:
+            self.wiener_filter = nn.Sequential(
+                nn.Linear(inner_channels, inner_channels),
+                norm_klass(inner_channels),
+                nn.PReLU(),
+                nn.Linear(inner_channels, inner_channels),
+                nn.Tanh()
+            )
+        
+        # Output projection
+        self.output_proj = nn.Sequential(
+            nn.Linear(inner_channels, dim),
+            nn.Dropout(dropout)
+        )
+        
+        # Residual connection with learnable scaling
+        self.residual_scale = nn.Parameter(torch.ones(1))
+        
+    def forward(self, x):
+        """
+        Forward pass of the denoise layer.
+        
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor of shape [B, L, D]
+            where B = batch size, L = sequence length, D = dimension
+            
+        Returns
+        -------
+        torch.Tensor
+            Denoised output tensor of shape [B, L, D]
+        """
+        residual = x
+        
+        # Input projection
+        x_proj = self.input_proj(x)
+        
+        # Noise estimation
+        noise_mask = self.noise_estimator(x_proj)
+        
+        # Apply noise reduction techniques
+        denoised = x_proj
+        
+        # Spectral subtraction
+        if self.use_spectral_subtraction:
+            spectral_mask = self.spectral_subtraction(x_proj)
+            denoised = denoised * (1 - noise_mask * spectral_mask)
+        
+        # Wiener filtering
+        if self.use_wiener_filter:
+            wiener_coeff = self.wiener_filter(x_proj)
+            denoised = denoised * wiener_coeff
+        
+        # Output projection
+        output = self.output_proj(denoised)
+        
+        # Residual connection with learnable scaling
+        return residual + self.residual_scale * output
+
+class AdaptiveDenoiseLayer(nn.Module):
+    """Adaptive denoise layer that learns noise characteristics dynamically.
+    
+    This layer adapts its denoising strategy based on the input signal characteristics,
+    making it more effective for different types of noise.
+    
+    Arguments
+    ---------
+    dim : int
+        Input/output dimension
+    inner_channels : int
+        Inner channel dimension for processing
+    num_heads : int
+        Number of attention heads for adaptive processing
+    dropout : float
+        Dropout rate for regularization
+    """
+    
+    def __init__(
+        self,
+        dim,
+        inner_channels=256,
+        num_heads=8,
+        dropout=0.1,
+        norm_type='scalenorm'
+    ):
+        super(AdaptiveDenoiseLayer, self).__init__()
+        
+        if norm_type == 'scalenorm':
+            norm_klass = ScaleNorm
+        elif norm_type == 'layernorm':
+            norm_klass = nn.LayerNorm
+        else:
+            norm_klass = nn.LayerNorm
+            
+        self.dim = dim
+        self.inner_channels = inner_channels
+        self.num_heads = num_heads
+        
+        # Input processing
+        self.input_norm = norm_klass(dim)
+        self.input_proj = nn.Linear(dim, inner_channels)
+        
+        # Multi-head attention for noise pattern recognition
+        self.noise_attention = nn.MultiheadAttention(
+            embed_dim=inner_channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # Adaptive noise reduction
+        self.adaptive_reduction = nn.Sequential(
+            nn.Linear(inner_channels, inner_channels),
+            norm_klass(inner_channels),
+            nn.PReLU(),
+            nn.Linear(inner_channels, inner_channels),
+            nn.Sigmoid()
+        )
+        
+        # Output processing
+        self.output_norm = norm_klass(inner_channels)
+        self.output_proj = nn.Linear(inner_channels, dim)
+        
+        # Learnable parameters for adaptation
+        self.adaptation_scale = nn.Parameter(torch.ones(1))
+        self.adaptation_bias = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        """
+        Forward pass of the adaptive denoise layer.
+        
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor of shape [B, L, D]
+            
+        Returns
+        -------
+        torch.Tensor
+            Denoised output tensor of shape [B, L, D]
+        """
+        residual = x
+        
+        # Input normalization and projection
+        x_norm = self.input_norm(x)
+        x_proj = self.input_proj(x_norm)
+        
+        # Multi-head attention for noise pattern recognition
+        attn_out, _ = self.noise_attention(x_proj, x_proj, x_proj)
+        
+        # Adaptive noise reduction
+        reduction_mask = self.adaptive_reduction(attn_out)
+        denoised = x_proj * reduction_mask
+        
+        # Output processing
+        output_norm = self.output_norm(denoised)
+        output = self.output_proj(output_norm)
+        
+        # Adaptive residual connection
+        return residual + self.adaptation_scale * output + self.adaptation_bias
+
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
         self,
@@ -787,7 +1020,10 @@ class MossformerBlock_GFSMN(nn.Module):
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
         shift_tokens = True,
-        flash_attn_config = None
+        flash_attn_config = None,
+        use_denoise = False,
+        denoise_type = 'adaptive',  # 'basic' or 'adaptive'
+        denoise_config = None
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -796,8 +1032,10 @@ class MossformerBlock_GFSMN(nn.Module):
             norm_klass = ScaleNorm
         elif norm_type == 'layernorm':
             norm_klass = nn.LayerNorm
- 
+
         self.group_size = group_size
+        self.use_denoise = use_denoise
+        self.denoise_type = denoise_type
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
@@ -819,6 +1057,31 @@ class MossformerBlock_GFSMN(nn.Module):
         
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
         self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True, flash_attn_config = enhanced_flash_config) for _ in range(depth)])
+        
+        # Add denoise layers if enabled
+        if self.use_denoise:
+            denoise_config = denoise_config or {}
+            if self.denoise_type == 'basic':
+                self.denoise_layers = nn.ModuleList([
+                    DenoiseLayer(
+                        dim=dim,
+                        inner_channels=denoise_config.get('inner_channels', 256),
+                        dropout=denoise_config.get('dropout', 0.1),
+                        use_spectral_subtraction=denoise_config.get('use_spectral_subtraction', True),
+                        use_wiener_filter=denoise_config.get('use_wiener_filter', True),
+                        norm_type=norm_type
+                    ) for _ in range(depth)
+                ])
+            elif self.denoise_type == 'adaptive':
+                self.denoise_layers = nn.ModuleList([
+                    AdaptiveDenoiseLayer(
+                        dim=dim,
+                        inner_channels=denoise_config.get('inner_channels', 256),
+                        num_heads=denoise_config.get('num_heads', 8),
+                        dropout=denoise_config.get('dropout', 0.1),
+                        norm_type=norm_type
+                    ) for _ in range(depth)
+                ])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -837,6 +1100,11 @@ class MossformerBlock_GFSMN(nn.Module):
         for flash in self.layers:
             x = flash(x, mask = mask)
             x = self.fsmn[ii](x)
+            
+            # Apply denoise layer if enabled
+            if self.use_denoise and hasattr(self, 'denoise_layers'):
+                x = self.denoise_layers[ii](x)
+            
             ii = ii + 1
         return x
 
@@ -853,7 +1121,10 @@ class MossformerBlock(nn.Module):
         attn_dropout = 0.1,
         norm_type = 'scalenorm',
         shift_tokens = True,
-        flash_attn_config = None
+        flash_attn_config = None,
+        use_denoise = False,
+        denoise_type = 'adaptive',  # 'basic' or 'adaptive'
+        denoise_config = None
     ):
         super().__init__()
         assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
@@ -864,6 +1135,8 @@ class MossformerBlock(nn.Module):
             norm_klass = nn.LayerNorm
 
         self.group_size = group_size
+        self.use_denoise = use_denoise
+        self.denoise_type = denoise_type
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
@@ -884,6 +1157,31 @@ class MossformerBlock(nn.Module):
             enhanced_flash_config.update(flash_attn_config)
         
         self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens, use_flash_attn = True, flash_attn_config = enhanced_flash_config) for _ in range(depth)])
+        
+        # Add denoise layers if enabled
+        if self.use_denoise:
+            denoise_config = denoise_config or {}
+            if self.denoise_type == 'basic':
+                self.denoise_layers = nn.ModuleList([
+                    DenoiseLayer(
+                        dim=dim,
+                        inner_channels=denoise_config.get('inner_channels', 256),
+                        dropout=denoise_config.get('dropout', 0.1),
+                        use_spectral_subtraction=denoise_config.get('use_spectral_subtraction', True),
+                        use_wiener_filter=denoise_config.get('use_wiener_filter', True),
+                        norm_type=norm_type
+                    ) for _ in range(depth)
+                ])
+            elif self.denoise_type == 'adaptive':
+                self.denoise_layers = nn.ModuleList([
+                    AdaptiveDenoiseLayer(
+                        dim=dim,
+                        inner_channels=denoise_config.get('inner_channels', 256),
+                        num_heads=denoise_config.get('num_heads', 8),
+                        dropout=denoise_config.get('dropout', 0.1),
+                        norm_type=norm_type
+                    ) for _ in range(depth)
+                ])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -901,6 +1199,11 @@ class MossformerBlock(nn.Module):
         ii = 0
         for flash in self.layers:
             x = flash(x, mask = mask)
+            
+            # Apply denoise layer if enabled
+            if self.use_denoise and hasattr(self, 'denoise_layers'):
+                x = self.denoise_layers[ii](x)
+            
             ii = ii + 1
         return x
 
@@ -913,10 +1216,13 @@ def create_enhanced_mossformer_block(
     use_alibi=True,
     use_sliding_window=False,
     use_softcap=False,
+    use_denoise=False,
+    denoise_type='adaptive',
+    denoise_config=None,
     **kwargs
 ):
     """
-    Create MossFormer2 block with enhanced Flash Attention features
+    Create MossFormer2 block with enhanced Flash Attention features and optional denoise layers
     
     Args:
         dim: Model dimension
@@ -926,6 +1232,9 @@ def create_enhanced_mossformer_block(
         use_alibi: Enable ALiBi positional bias
         use_sliding_window: Enable sliding window attention
         use_softcap: Enable softcapping
+        use_denoise: Enable denoise layers in Repeat R times loop
+        denoise_type: Type of denoise layer ('basic' or 'adaptive')
+        denoise_config: Configuration for denoise layers
         **kwargs: Additional arguments
     """
     
@@ -946,5 +1255,79 @@ def create_enhanced_mossformer_block(
         group_size=group_size,
         query_key_dim=query_key_dim,
         flash_attn_config=flash_attn_config,
+        use_denoise=use_denoise,
+        denoise_type=denoise_type,
+        denoise_config=denoise_config,
+        **kwargs
+    )
+
+def create_denoise_mossformer_block(
+    dim=512,
+    depth=6,
+    group_size=256,
+    query_key_dim=128,
+    denoise_type='adaptive',
+    denoise_config=None,
+    **kwargs
+):
+    """
+    Create MossFormer2 block with denoise layers for training with noisy data
+    
+    Args:
+        dim: Model dimension
+        depth: Number of layers
+        group_size: Group size for attention
+        query_key_dim: Query/Key dimension
+        denoise_type: Type of denoise layer ('basic' or 'adaptive')
+        denoise_config: Configuration for denoise layers
+        **kwargs: Additional arguments
+        
+    Example:
+        >>> # Basic denoise configuration
+        >>> basic_config = {
+        ...     'inner_channels': 256,
+        ...     'dropout': 0.1,
+        ...     'use_spectral_subtraction': True,
+        ...     'use_wiener_filter': True
+        ... }
+        >>> model = create_denoise_mossformer_block(
+        ...     dim=512, depth=6, denoise_type='basic', denoise_config=basic_config
+        ... )
+        
+        >>> # Adaptive denoise configuration
+        >>> adaptive_config = {
+        ...     'inner_channels': 256,
+        ...     'num_heads': 8,
+        ...     'dropout': 0.1
+        ... }
+        >>> model = create_denoise_mossformer_block(
+        ...     dim=512, depth=6, denoise_type='adaptive', denoise_config=adaptive_config
+        ... )
+    """
+    
+    # Default denoise configuration
+    if denoise_config is None:
+        if denoise_type == 'basic':
+            denoise_config = {
+                'inner_channels': 256,
+                'dropout': 0.1,
+                'use_spectral_subtraction': True,
+                'use_wiener_filter': True
+            }
+        else:  # adaptive
+            denoise_config = {
+                'inner_channels': 256,
+                'num_heads': 8,
+                'dropout': 0.1
+            }
+    
+    return MossformerBlock_GFSMN(
+        dim=dim,
+        depth=depth,
+        group_size=group_size,
+        query_key_dim=query_key_dim,
+        use_denoise=True,
+        denoise_type=denoise_type,
+        denoise_config=denoise_config,
         **kwargs
     )
