@@ -1021,7 +1021,7 @@ class MossformerBlock_GFSMN(nn.Module):
         norm_type = 'scalenorm',
         shift_tokens = True,
         flash_attn_config = None,
-        use_denoise = False,
+        use_denoise = True,  # Always enable denoising by default
         denoise_type = 'adaptive',  # 'basic' or 'adaptive'
         denoise_config = None
     ):
@@ -1122,7 +1122,7 @@ class MossformerBlock(nn.Module):
         norm_type = 'scalenorm',
         shift_tokens = True,
         flash_attn_config = None,
-        use_denoise = False,
+        use_denoise = True,  # Always enable denoising by default
         denoise_type = 'adaptive',  # 'basic' or 'adaptive'
         denoise_config = None
     ):
@@ -1216,7 +1216,7 @@ def create_enhanced_mossformer_block(
     use_alibi=True,
     use_sliding_window=False,
     use_softcap=False,
-    use_denoise=False,
+    use_denoise=True,  # Always enable denoising by default
     denoise_type='adaptive',
     denoise_config=None,
     **kwargs
