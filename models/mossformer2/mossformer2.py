@@ -321,7 +321,7 @@ class MossFormerM(nn.Module):
         query_key_dim = 128,
         expansion_factor = 4.,
         attn_dropout = 0.1,
-        use_denoise = False,
+        use_denoise = True,  # Always enable denoising by default
         denoise_type = 'adaptive',
         denoise_config = None
     ):
@@ -407,7 +407,7 @@ class MossFormerM2(nn.Module):
         query_key_dim = 128,
         expansion_factor = 4.,
         attn_dropout = 0.1,
-        use_denoise = False,
+        use_denoise = True,  # Always enable denoising by default
         denoise_type = 'adaptive',
         denoise_config = None
     ):
@@ -483,7 +483,7 @@ class Computation_Block(nn.Module):
         out_channels,
         norm="ln",
         skip_around_intra=True,
-        use_denoise=False,
+        use_denoise=True,  # Always enable denoising by default
         denoise_type='adaptive',
         denoise_config=None
     ):
@@ -586,7 +586,7 @@ class MossFormer_MaskNet(nn.Module):
         skip_around_intra=True,
         use_global_pos_enc=True,
         max_length=20000,
-        use_denoise=False,
+        use_denoise=True,  # Always enable denoising by default
         denoise_type='adaptive',
         denoise_config=None
     ):
@@ -727,7 +727,7 @@ class MossFormer(nn.Module):
         skip_around_intra=True,
         use_global_pos_enc=True,
         max_length=20000,
-        use_denoise=False,
+        use_denoise=True,  # Always enable denoising by default
         denoise_type='adaptive',
         denoise_config=None
     ):
@@ -786,6 +786,11 @@ class MossFormer2_SS(nn.Module):
 
     def __init__(self, args):
         super(MossFormer2_SS, self).__init__()
+        # Enable denoise by default or from args
+        use_denoise = getattr(args, 'use_denoise', True)
+        denoise_type = getattr(args, 'denoise_type', 'adaptive')
+        denoise_config = getattr(args, 'denoise_config', None)
+        
         self.model = MossFormer(
             in_channels=args.encoder_embedding_dim,
             out_channels=args.mossformer_sequence_dim,
@@ -795,7 +800,10 @@ class MossFormer2_SS(nn.Module):
             num_spks=args.num_spks,
             skip_around_intra=True,
             use_global_pos_enc=True,
-            max_length=20000)
+            max_length=20000,
+            use_denoise=use_denoise,
+            denoise_type=denoise_type,
+            denoise_config=denoise_config)
 
     def forward(self, x):
         outputs = self.model(x)
