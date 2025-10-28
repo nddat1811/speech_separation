@@ -1,0 +1,37 @@
+#!/bin/bash 
+mode: 'train'
+use_cuda: 1 # 1 for True, 0 for False
+
+sampling_rate: 16000
+network: "MossFormer2_SS_16K"  ##network type
+## MossFormer2 parameters
+num_spks: 2 
+encoder_kernel_size: 16
+encoder_embedding_dim: 512
+mossformer_sequence_dim: 512
+num_mossformer_layer: 24
+
+# Train
+load_type: 'one_input_multi_outputs'
+tr_list: 'data/LibriMix/2speakers/wav16k/min/Mini_train-100_Libri2Mix_clean_16k_max_100.scp'
+cv_list: 'data/LibriMix/2speakers/wav16k/min/Mini_val_Libri2Mix_clean_16k_max_100.scp'
+
+init_learning_rate: 0.00015 #learning rate for a new training
+finetune_learning_rate: 0.00005 #learning rate for a finetune training
+
+loss_threshold: -9999.0 #to prevent very low loss
+max_epoch: 200
+
+weight_decay: 0.00001
+clip_grad_norm: 10.
+
+# Log 
+seed: 1811
+
+# # dataset
+num_workers: 2
+batch_size: 1
+accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
+effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
+max_length: 2         # truncate the utterances in dataloader, in seconds 
+

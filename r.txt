@@ -1,0 +1,10 @@
+yamlargparse==1.31.1
+torchinfo==1.8.0
+rotary-embedding-torch==0.8.3
+pesq==0.0.4
+soundfile
+librosa
+tensorboard
+yamlargparse
+packaging
+ninja
