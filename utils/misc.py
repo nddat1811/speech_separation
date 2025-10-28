@@ -43,11 +43,12 @@ def read_and_config_file(input_path, decode=0):
     return processed_list
 
 def load_checkpoint(checkpoint_path, use_cuda):
-    #if use_cuda:
-    #    checkpoint = torch.load(checkpoint_path)
-    #else:
-    checkpoint = torch.load(
-            checkpoint_path, map_location=lambda storage, loc: storage)
+    if use_cuda:
+      print("Inferencing - Using GPU")
+      checkpoint = torch.load(checkpoint_path, weights_only=False)
+    else:
+      print("Inferencing - Using CPU")
+      checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
     return checkpoint
 
 def get_learning_rate(optimizer):
