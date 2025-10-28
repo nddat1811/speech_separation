@@ -12,6 +12,7 @@ import soundfile as sf
 import librosa
 import numpy as np
 import time
+from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 import warnings
@@ -84,7 +85,7 @@ def ensure_directories():
     os.makedirs("outputs/try/input", exist_ok=True)
     os.makedirs("outputs/try/output", exist_ok=True)
 
-def process_audio_file(input_path, output_dir):
+def process_audio_file(input_path, output_dir, output_prefix=None):
     """Process audio file using MossFormer2"""
     global model, device, args
     
@@ -104,7 +105,8 @@ def process_audio_file(input_path, output_dir):
         
         # Save separated audio files
         output_files = []
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        # If an explicit prefix is provided (e.g., timestamp), use it; otherwise fall back to input base name
+        base_name = output_prefix if output_prefix else os.path.splitext(os.path.basename(input_path))[0]
         
         for spk in range(args.num_spks):
             output_audio = output_audios[spk]
@@ -142,13 +144,11 @@ def upload_file():
         
         if file:
             # Secure filename
-            filename = secure_filename(file.filename)
-            if not filename:
-                filename = f"audio_{int(time.time())}.wav"
-            
-            # Ensure .wav extension
-            if not filename.lower().endswith('.wav'):
-                filename = os.path.splitext(filename)[0] + '.wav'
+            raw_name = secure_filename(file.filename)
+            # Build a timestamp to ensure uniqueness across uploads
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            base = os.path.splitext(raw_name)[0] if raw_name else 'audio'
+            filename = f"{base}_{ts}.wav"
             
             # Save uploaded file
             input_path = os.path.join("outputs/try/input", filename)
@@ -156,8 +156,9 @@ def upload_file():
             
             print(f"File saved to: {input_path}")
             
-            # Process the audio
-            output_files = process_audio_file(input_path, "outputs/try/output")
+            # Process the audio with the same base+timestamp prefix
+            output_prefix = f"{base}_{ts}"
+            output_files = process_audio_file(input_path, "outputs/try/output", output_prefix=output_prefix)
             
             # Prepare response
             response_data = {
