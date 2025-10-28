@@ -239,10 +239,10 @@
             display: none;
         }
 
-        /* Two-column layout for input (left) and outputs (right) */
+        /* Three-column layout: Input | Speaker 1 | Speaker 2 */
         .results-grid {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: 1fr 1fr 1fr;
             gap: 20px;
         }
 
@@ -250,6 +250,13 @@
             color: #495057;
             margin-bottom: 15px;
             text-align: center;
+        }
+
+        /* Stack outputs on the right column with spacing */
+        #audioResults {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
         }
 
         .audio-player {
@@ -407,9 +414,13 @@
                             <h3>Input</h3>
                             <div id="inputAudio"></div>
                         </div>
-                        <div class="results-col" id="outputsCol">
-                            <h3>Outputs</h3>
-                            <div id="audioResults"></div>
+                        <div class="results-col" id="leftOutputCol">
+                            <h3>Speaker 1</h3>
+                            <div id="leftOutput"></div>
+                        </div>
+                        <div class="results-col" id="rightOutputCol">
+                            <h3>Speaker 2</h3>
+                            <div id="rightOutput"></div>
                         </div>
                     </div>
                 </div>
@@ -643,11 +654,13 @@
 
         function showResults(data) {
             const results = document.getElementById('results');
-            const audioResults = document.getElementById('audioResults');
             const inputAudio = document.getElementById('inputAudio');
+            const leftOutput = document.getElementById('leftOutput');
+            const rightOutput = document.getElementById('rightOutput');
             
-            audioResults.innerHTML = '';
             inputAudio.innerHTML = '';
+            leftOutput.innerHTML = '';
+            rightOutput.innerHTML = '';
             
             // Render input (left)
             if (data.input_file_path) {
@@ -667,7 +680,7 @@
                 inputAudio.appendChild(inputDiv);
             }
             
-            // Render outputs (right)
+            // Render outputs: speaker 1 -> left, speaker 2 -> right
             data.files.forEach((file, index) => {
                 const audioDiv = document.createElement('div');
                 audioDiv.className = 'audio-player';
@@ -683,7 +696,11 @@
                     <br>
                     <a href="${downloadUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
                 `;
-                audioResults.appendChild(audioDiv);
+                if (index === 0) {
+                    leftOutput.appendChild(audioDiv);
+                } else {
+                    rightOutput.appendChild(audioDiv);
+                }
             });
             
             results.style.display = 'block';
