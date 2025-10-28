@@ -91,7 +91,7 @@ def reload_for_eval(model, checkpoint_dir, use_cuda):
              state[key] = pretrained_model[key.replace('module.', '')]
         elif 'module.'+key in pretrained_model and state[key].shape == pretrained_model['module.'+key].shape:
              state[key] = pretrained_model['module.'+key]
-        elif self.print: print(f'{key} not loaded')
+        else: print(f'{key} not loaded')
     model.load_state_dict(state)
     print('=> Reload well-trained model {} for decoding.'.format(
             model_name))

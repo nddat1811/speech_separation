@@ -1,12 +1,12 @@
 #!/bin/bash 
 mode: 'inference'
-use_cuda: 1 # 1 for True, 0 for False
+use_cuda: 0 # 1 for True, 0 for False
 num_gpu: 1
 sampling_rate: 8000
 network: "MossFormer2_SS_8K"  ##network type
 checkpoint_dir: "checkpoints/MossFormer2_SS_8K"
 
-input_path: "data/tt_wsj0_2mix_16k.scp"  # an input dir or input scp file
+input_path: "data/tt_vivo_2mix_8k.scp"  # an input dir or input scp file
 output_dir: "outputs/MossFormer2_SS_8K" ## output dir to store processed audio
 
 # decode parameters

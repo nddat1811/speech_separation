@@ -12,3 +12,5 @@ __pycache__/
 *$py.class
 env/
 flashattention/*
+venv/
+checkpoints/

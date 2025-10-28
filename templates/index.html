@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Source Separation Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            font-weight: 300;
+        }
+
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 1px solid #dee2e6;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            background: #f8f9fa;
+            border: none;
+            font-size: 1.1em;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            color: #6c757d;
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+        }
+
+        .tab:hover {
+            background: #e9ecef;
+        }
+
+        .tab-content {
+            display: none;
+            padding: 40px;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Tab 1 - Experience Styles */
+        .upload-section {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 60px 20px;
+            margin: 20px 0;
+            background: #f8f9ff;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .upload-area:hover {
+            border-color: #5a6fd8;
+            background: #f0f2ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #4c63d2;
+            background: #e8ebff;
+        }
+
+        .upload-icon {
+            font-size: 3em;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+
+        .upload-text {
+            font-size: 1.2em;
+            color: #495057;
+            margin-bottom: 10px;
+        }
+
+        .upload-subtext {
+            color: #6c757d;
+            font-size: 0.9em;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 25px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 10px;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-microphone {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%);
+            box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);
+        }
+
+        .btn-microphone:hover {
+            box-shadow: 0 6px 20px rgba(255, 107, 107, 0.4);
+        }
+
+        .btn-microphone.recording {
+            background: linear-gradient(135deg, #ff4757 0%, #c44569 100%);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+
+        .processing {
+            text-align: center;
+            margin: 20px 0;
+            display: none;
+        }
+
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .results {
+            margin-top: 30px;
+            display: none;
+        }
+
+        .audio-player {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 15px 0;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        .audio-player h4 {
+            color: #495057;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+        }
+
+        audio {
+            width: 100%;
+            height: 40px;
+        }
+
+        /* Tab 2 - Demo Styles */
+        .demo-section {
+            margin-bottom: 30px;
+        }
+
+        .demo-section h3 {
+            color: #495057;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+            text-align: center;
+        }
+
+        .demo-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .demo-item {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .demo-item:hover {
+            transform: translateY(-5px);
+        }
+
+        .demo-item h4 {
+            color: #495057;
+            margin-bottom: 15px;
+            text-align: center;
+        }
+
+        .demo-audio {
+            margin-bottom: 15px;
+        }
+
+        .demo-audio h5 {
+            color: #6c757d;
+            margin-bottom: 10px;
+            font-size: 0.9em;
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #f5c6cb;
+        }
+
+        .success {
+            background: #d4edda;
+            color: #155724;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            border: 1px solid #c3e6cb;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .tab-content {
+                padding: 20px;
+            }
+            
+            .demo-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Audio Source Separation</h1>
+            <p>Tách âm thanh từ hỗn hợp nhiều người nói</p>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('experience')">Trải nghiệm</button>
+            <button class="tab" onclick="switchTab('demo')">Demo</button>
+        </div>
+
+        <!-- Tab 1: Experience -->
+        <div id="experience" class="tab-content active">
+            <div class="upload-section">
+                <h2 style="text-align: center; color: #495057; margin-bottom: 30px;">Tải lên file âm thanh để tách</h2>
+                
+                <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+                    <div class="upload-icon">🎵</div>
+                    <div class="upload-text">Kéo thả file âm thanh vào đây hoặc click để chọn</div>
+                    <div class="upload-subtext">Hỗ trợ: WAV, MP3, FLAC, M4A (tối đa 16MB)</div>
+                </div>
+                
+                <input type="file" id="fileInput" class="file-input" accept="audio/*" onchange="handleFileSelect(event)">
+                
+                <div style="margin: 30px 0;">
+                    <button class="btn btn-microphone" id="micBtn" onclick="toggleMicrophone()">
+                        🎤 Thu âm từ microphone
+                    </button>
+                </div>
+                
+                <div class="processing" id="processing">
+                    <div class="spinner"></div>
+                    <p>Đang xử lý âm thanh...</p>
+                </div>
+                
+                <div class="results" id="results">
+                    <h3 style="text-align: center; color: #495057; margin-bottom: 20px;">Kết quả tách âm</h3>
+                    <div id="audioResults"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 2: Demo -->
+        <div id="demo" class="tab-content">
+            <div class="demo-section">
+                <h3>WSJO_MIX</h3>
+                <div class="demo-grid" id="wsjoDemo"></div>
+            </div>
+            
+            <div class="demo-section">
+                <h3>WHAM</h3>
+                <div class="demo-grid" id="whamDemo"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+
+        function switchTab(tabName) {
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked tab
+            event.target.classList.add('active');
+            
+            // Load demo data if switching to demo tab
+            if (tabName === 'demo') {
+                loadDemoData();
+            }
+        }
+
+        function handleFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                uploadFile(file);
+            }
+        }
+
+        function uploadFile(file) {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            showProcessing(true);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                showProcessing(false);
+                if (data.success) {
+                    showResults(data);
+                } else {
+                    showError(data.error || 'Có lỗi xảy ra khi xử lý file');
+                }
+            })
+            .catch(error => {
+                showProcessing(false);
+                showError('Lỗi kết nối: ' + error.message);
+            });
+        }
+
+        function toggleMicrophone() {
+            if (!isRecording) {
+                startRecording();
+            } else {
+                stopRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = event => {
+                    audioChunks.push(event.data);
+                };
+                
+                mediaRecorder.onstop = () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                    uploadFile(audioBlob);
+                };
+                
+                mediaRecorder.start();
+                isRecording = true;
+                
+                const micBtn = document.getElementById('micBtn');
+                micBtn.textContent = '⏹️ Dừng thu âm';
+                micBtn.classList.add('recording');
+                
+            } catch (error) {
+                showError('Không thể truy cập microphone: ' + error.message);
+            }
+        }
+
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                
+                isRecording = false;
+                
+                const micBtn = document.getElementById('micBtn');
+                micBtn.textContent = '🎤 Thu âm từ microphone';
+                micBtn.classList.remove('recording');
+            }
+        }
+
+        function showProcessing(show) {
+            const processing = document.getElementById('processing');
+            const results = document.getElementById('results');
+            
+            if (show) {
+                processing.style.display = 'block';
+                results.style.display = 'none';
+            } else {
+                processing.style.display = 'none';
+            }
+        }
+
+        function showResults(data) {
+            const results = document.getElementById('results');
+            const audioResults = document.getElementById('audioResults');
+            
+            audioResults.innerHTML = '';
+            
+            // Debug info
+            console.log('Results data:', data);
+            
+            data.files.forEach((file, index) => {
+                const audioDiv = document.createElement('div');
+                audioDiv.className = 'audio-player';
+                
+                // Create proper file path
+                const filePath = data.file_paths ? data.file_paths[index] : `${data.temp_dir}/separated_speaker_${index + 1}.wav`;
+                const downloadUrl = `/download/${filePath}`;
+                
+                console.log(`Speaker ${index + 1} file path:`, filePath);
+                console.log(`Download URL:`, downloadUrl);
+                
+                audioDiv.innerHTML = `
+                    <h4>Speaker ${index + 1}</h4>
+                    <p style="font-size: 0.8em; color: #666;">File: ${filePath}</p>
+                    <audio controls preload="metadata">
+                        <source src="${downloadUrl}" type="audio/wav">
+                        <source src="${downloadUrl}" type="audio/mpeg">
+                        Trình duyệt không hỗ trợ phát âm thanh.
+                    </audio>
+                    <br>
+                    <a href="${downloadUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
+                `;
+                audioResults.appendChild(audioDiv);
+            });
+            
+            results.style.display = 'block';
+        }
+
+        function showError(message) {
+            const results = document.getElementById('results');
+            const audioResults = document.getElementById('audioResults');
+            
+            audioResults.innerHTML = `<div class="error">${message}</div>`;
+            results.style.display = 'block';
+        }
+
+        function loadDemoData() {
+            fetch('/demo_files')
+            .then(response => response.json())
+            .then(data => {
+                if (data.demo_files) {
+                    displayDemoFiles(data.demo_files);
+                } else {
+                    showDemoError(data.error || 'Không thể tải dữ liệu demo');
+                }
+            })
+            .catch(error => {
+                showDemoError('Lỗi kết nối: ' + error.message);
+            });
+        }
+
+        function displayDemoFiles(files) {
+            const wsjoDemo = document.getElementById('wsjoDemo');
+            const whamDemo = document.getElementById('whamDemo');
+            
+            wsjoDemo.innerHTML = '';
+            whamDemo.innerHTML = '';
+            
+            files.forEach(file => {
+                const demoItem = document.createElement('div');
+                demoItem.className = 'demo-item';
+                
+                let content = `<h4>${file.name}</h4>`;
+                
+                if (file.before) {
+                    content += `
+                        <div class="demo-audio">
+                            <h5>Original Audio - Mixed</h5>
+                            <audio controls>
+                                <source src="/download/${file.before}" type="audio/wav">
+                            </audio>
+                        </div>
+                    `;
+                }
+                
+                if (file.after) {
+                    content += `
+                        <div class="demo-audio">
+                            <h5>Separated Audio</h5>
+                            <audio controls>
+                                <source src="/download/${file.after}" type="audio/wav">
+                            </audio>
+                        </div>
+                    `;
+                }
+                
+                demoItem.innerHTML = content;
+                
+                // Add to both sections for now (you can modify this logic)
+                wsjoDemo.appendChild(demoItem.cloneNode(true));
+                whamDemo.appendChild(demoItem.cloneNode(true));
+            });
+        }
+
+        function showDemoError(message) {
+            const wsjoDemo = document.getElementById('wsjoDemo');
+            const whamDemo = document.getElementById('whamDemo');
+            
+            wsjoDemo.innerHTML = `<div class="error">${message}</div>`;
+            whamDemo.innerHTML = `<div class="error">${message}</div>`;
+        }
+
+        // Drag and drop functionality
+        const uploadArea = document.querySelector('.upload-area');
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                uploadFile(files[0]);
+            }
+        });
+    </script>
+</body>
+</html>
