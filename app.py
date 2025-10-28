@@ -30,6 +30,9 @@ from networks import network_wrapper
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+# Enable template auto-reload during development
+app.config['TEMPLATES_AUTO_RELOAD'] = True
+app.jinja_env.auto_reload = True
 
 # Global variables for model
 model = None
@@ -165,7 +168,9 @@ def upload_file():
                 'success': True,
                 'files': output_files,
                 'file_paths': output_files,
-                'temp_dir': 'outputs/try/output'
+                'temp_dir': 'outputs/try/output',
+                'input_file_path': f"outputs/try/input/{filename}",
+                'input_file_name': filename
             }
             
             return jsonify(response_data)
@@ -243,5 +248,6 @@ if __name__ == '__main__':
     print("\nStarting Flask server...")
     print("Open http://localhost:5000 in your browser")
     
-    # Run Flask app
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # Run Flask app (enable auto-reload if FLASK_DEBUG=1)
+    debug_flag = os.environ.get('FLASK_DEBUG', '0') == '1'
+    app.run(host='0.0.0.0', port=5000, debug=debug_flag, use_reloader=debug_flag)

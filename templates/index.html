@@ -92,11 +92,12 @@
         .upload-area {
             border: 3px dashed #667eea;
             border-radius: 15px;
-            padding: 60px 20px;
+            padding: 40px 20px; /* thinner so the area is less tall */
             margin: 20px 0;
             background: #f8f9ff;
             transition: all 0.3s ease;
             cursor: pointer;
+            position: relative; /* allow inline mic positioning */
         }
 
         .upload-area:hover {
@@ -168,6 +169,44 @@
             animation: pulse 1.5s infinite;
         }
 
+        /* Small inline mic button inside upload area */
+        .btn-inline-mic {
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0;
+            font-size: 18px;
+        }
+
+        .inline-actions {
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+
+        .recording-label {
+            background: #eef2ff;
+            color: #4c63d2;
+            border: 1px solid #dce3ff;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.15);
+            display: inline-block; /* always visible with hint */
+        }
+
+        .recording-label.active {
+            background: #ffe3e3;
+            color: #c0392b;
+            border: 1px solid #ffc9c9;
+            box-shadow: 0 2px 8px rgba(255, 99, 99, 0.25);
+        }
+
         @keyframes pulse {
             0% { transform: scale(1); }
             50% { transform: scale(1.05); }
@@ -198,6 +237,19 @@
         .results {
             margin-top: 30px;
             display: none;
+        }
+
+        /* Two-column layout for input (left) and outputs (right) */
+        .results-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .results-col h3 {
+            color: #495057;
+            margin-bottom: 15px;
+            text-align: center;
         }
 
         .audio-player {
@@ -325,12 +377,20 @@
                     <div class="upload-icon">🎵</div>
                     <div class="upload-text">Kéo thả file âm thanh vào đây hoặc click để chọn</div>
                     <div class="upload-subtext">Hỗ trợ: WAV, MP3, FLAC, M4A (tối đa 16MB)</div>
+                    <div class="inline-actions">
+                        <button class="btn btn-microphone btn-inline-mic" id="micBtn"
+                                title="Thu âm từ microphone"
+                                onclick="event.stopPropagation(); toggleMicrophone();">
+                            🎤
+                        </button>
+                        <span id="recordingLabel" class="recording-label">Nhấn để ghi âm</span>
+                    </div>
                 </div>
                 
                 <input type="file" id="fileInput" class="file-input" accept="audio/*" onchange="handleFileSelect(event)">
                 
-                <div style="margin: 30px 0;">
-                    <button class="btn btn-microphone" id="micBtn" onclick="toggleMicrophone()">
+                <div style="margin: 30px 0; display: none;">
+                    <button class="btn btn-microphone" onclick="toggleMicrophone()">
                         🎤 Thu âm từ microphone
                     </button>
                 </div>
@@ -342,7 +402,16 @@
                 
                 <div class="results" id="results">
                     <h3 style="text-align: center; color: #495057; margin-bottom: 20px;">Kết quả tách âm</h3>
-                    <div id="audioResults"></div>
+                    <div class="results-grid">
+                        <div class="results-col" id="inputCol">
+                            <h3>Input</h3>
+                            <div id="inputAudio"></div>
+                        </div>
+                        <div class="results-col" id="outputsCol">
+                            <h3>Outputs</h3>
+                            <div id="audioResults"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -396,9 +465,13 @@
             }
         }
 
-        function uploadFile(file) {
+        function uploadFile(file, nameOverride) {
             const formData = new FormData();
-            formData.append('file', file);
+            if (nameOverride) {
+                formData.append('file', file, nameOverride);
+            } else {
+                formData.append('file', file);
+            }
             
             showProcessing(true);
             
@@ -432,24 +505,38 @@
         async function startRecording() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
+                const mime = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
+                mediaRecorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
                 audioChunks = [];
                 
                 mediaRecorder.ondataavailable = event => {
                     audioChunks.push(event.data);
                 };
                 
-                mediaRecorder.onstop = () => {
-                    const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                    uploadFile(audioBlob);
+                mediaRecorder.onstop = async () => {
+                    const rawBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                    try {
+                        const wavBlob = await blobToWav(rawBlob);
+                        const fname = `mic_${Date.now()}.wav`;
+                        uploadFile(wavBlob, fname);
+                    } catch (e) {
+                        // Fallback: upload raw blob; backend may still handle if supported
+                        uploadFile(rawBlob, `mic_${Date.now()}.webm`);
+                    }
                 };
                 
                 mediaRecorder.start();
                 isRecording = true;
                 
                 const micBtn = document.getElementById('micBtn');
-                micBtn.textContent = '⏹️ Dừng thu âm';
+                // change icon to stop (⏹️) by swapping content
+                micBtn.textContent = '⏹️';
                 micBtn.classList.add('recording');
+                const recLabel = document.getElementById('recordingLabel');
+                if (recLabel) {
+                    recLabel.textContent = 'Đang ghi âm... Nhấn để dừng';
+                    recLabel.classList.add('active');
+                }
                 
             } catch (error) {
                 showError('Không thể truy cập microphone: ' + error.message);
@@ -464,8 +551,81 @@
                 isRecording = false;
                 
                 const micBtn = document.getElementById('micBtn');
-                micBtn.textContent = '🎤 Thu âm từ microphone';
+                micBtn.textContent = '🎤';
                 micBtn.classList.remove('recording');
+                const recLabel = document.getElementById('recordingLabel');
+                if (recLabel) {
+                    recLabel.textContent = 'Nhấn để ghi âm';
+                    recLabel.classList.remove('active');
+                }
+            }
+        }
+
+        // Convert recorded blob (webm/opus) to PCM WAV (16-bit) in browser
+        async function blobToWav(blob) {
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+
+            const numChannels = audioBuffer.numberOfChannels;
+            const sampleRate = audioBuffer.sampleRate;
+            const numFrames = audioBuffer.length;
+
+            // Interleave channels
+            let interleaved;
+            if (numChannels === 2) {
+                const ch0 = audioBuffer.getChannelData(0);
+                const ch1 = audioBuffer.getChannelData(1);
+                interleaved = new Float32Array(numFrames * 2);
+                for (let i = 0, j = 0; i < numFrames; i++, j += 2) {
+                    interleaved[j] = ch0[i];
+                    interleaved[j + 1] = ch1[i];
+                }
+            } else {
+                interleaved = audioBuffer.getChannelData(0);
+            }
+
+            // Create WAV buffer
+            const bytesPerSample = 2;
+            const blockAlign = numChannels * bytesPerSample;
+            const buffer = new ArrayBuffer(44 + interleaved.length * bytesPerSample);
+            const view = new DataView(buffer);
+
+            // RIFF header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + interleaved.length * bytesPerSample, true);
+            writeString(view, 8, 'WAVE');
+
+            // fmt chunk
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true); // PCM
+            view.setUint16(20, 1, true); // linear PCM
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * blockAlign, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, 8 * bytesPerSample, true);
+
+            // data chunk
+            writeString(view, 36, 'data');
+            view.setUint32(40, interleaved.length * bytesPerSample, true);
+
+            // PCM samples
+            floatTo16BitPCM(view, 44, interleaved);
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        function floatTo16BitPCM(view, offset, input) {
+            for (let i = 0; i < input.length; i++, offset += 2) {
+                let s = Math.max(-1, Math.min(1, input[i]));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
             }
         }
 
@@ -484,30 +644,41 @@
         function showResults(data) {
             const results = document.getElementById('results');
             const audioResults = document.getElementById('audioResults');
+            const inputAudio = document.getElementById('inputAudio');
             
             audioResults.innerHTML = '';
+            inputAudio.innerHTML = '';
             
-            // Debug info
-            console.log('Results data:', data);
+            // Render input (left)
+            if (data.input_file_path) {
+                const inputDiv = document.createElement('div');
+                inputDiv.className = 'audio-player';
+                const inputUrl = `/download/${data.input_file_path}`;
+                inputDiv.innerHTML = `
+                    <h4>Input</h4>
+                    <p style="font-size: 0.8em; color: #666;">File: ${data.input_file_name || data.input_file_path}</p>
+                    <audio controls preload="metadata">
+                        <source src="${inputUrl}" type="audio/wav">
+                        <source src="${inputUrl}" type="audio/mpeg">
+                    </audio>
+                    <br>
+                    <a href="${inputUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
+                `;
+                inputAudio.appendChild(inputDiv);
+            }
             
+            // Render outputs (right)
             data.files.forEach((file, index) => {
                 const audioDiv = document.createElement('div');
                 audioDiv.className = 'audio-player';
-                
-                // Create proper file path
                 const filePath = data.file_paths ? data.file_paths[index] : `${data.temp_dir}/separated_speaker_${index + 1}.wav`;
                 const downloadUrl = `/download/${filePath}`;
-                
-                console.log(`Speaker ${index + 1} file path:`, filePath);
-                console.log(`Download URL:`, downloadUrl);
-                
                 audioDiv.innerHTML = `
                     <h4>Speaker ${index + 1}</h4>
                     <p style="font-size: 0.8em; color: #666;">File: ${filePath}</p>
                     <audio controls preload="metadata">
                         <source src="${downloadUrl}" type="audio/wav">
                         <source src="${downloadUrl}" type="audio/mpeg">
-                        Trình duyệt không hỗ trợ phát âm thanh.
                     </audio>
                     <br>
                     <a href="${downloadUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
