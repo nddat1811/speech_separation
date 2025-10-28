@@ -16,6 +16,13 @@ from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 import warnings
+import io
+
+# Matplotlib backend for server-side image rendering
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import speech_recognition as sr
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -38,6 +45,7 @@ app.jinja_env.auto_reload = True
 model = None
 device = None
 args = None
+recognizer = sr.Recognizer()
 
 def load_model():
     """Load the MossFormer2 model for inference"""
@@ -129,6 +137,17 @@ def process_audio_file(input_path, output_dir, output_prefix=None):
         print(f"Error processing audio: {str(e)}")
         raise e
 
+def transcribe_audio_vi(audio_path: str) -> str:
+    """Transcribe Vietnamese speech from a WAV file using Google Web Speech API."""
+    try:
+        with sr.AudioFile(audio_path) as source:
+            audio_data = recognizer.record(source)
+        text = recognizer.recognize_google(audio_data, language="vi-VN")
+        return text
+    except Exception as e:
+        print(f"Transcription error ({audio_path}): {e}")
+        return ""
+
 @app.route('/')
 def index():
     """Serve the main page"""
@@ -162,6 +181,11 @@ def upload_file():
             # Process the audio with the same base+timestamp prefix
             output_prefix = f"{base}_{ts}"
             output_files = process_audio_file(input_path, "outputs/try/output", output_prefix=output_prefix)
+            # Transcribe each output file (Vietnamese)
+            transcripts = []
+            for file_name in output_files:
+                abs_out = os.path.join("outputs/try/output", file_name)
+                transcripts.append(transcribe_audio_vi(abs_out))
             
             # Prepare response
             response_data = {
@@ -170,7 +194,8 @@ def upload_file():
                 'file_paths': output_files,
                 'temp_dir': 'outputs/try/output',
                 'input_file_path': f"outputs/try/input/{filename}",
-                'input_file_name': filename
+                'input_file_name': filename,
+                'transcripts': transcripts
             }
             
             return jsonify(response_data)
@@ -228,6 +253,45 @@ def demo_files():
 def health_check():
     """Health check endpoint"""
     return jsonify({'status': 'healthy', 'model_loaded': model is not None})
+
+@app.route('/waveform/<path:filepath>')
+def waveform_image(filepath):
+    """Render waveform image (PNG) for the given audio file path.
+    Only allow files inside known output directories.
+    """
+    try:
+        # Build absolute paths and validate
+        base_dir = os.path.abspath(os.getcwd())
+        allowed_roots = [
+            os.path.abspath(os.path.join(base_dir, 'outputs/try/input')),
+            os.path.abspath(os.path.join(base_dir, 'outputs/try/output')),
+            os.path.abspath(os.path.join(base_dir, 'outputs/MossFormer2_SS_8K')),
+        ]
+        abs_path = os.path.abspath(os.path.join(base_dir, filepath))
+        if not any(abs_path.startswith(root + os.sep) or abs_path == root for root in allowed_roots):
+            return jsonify({'error': 'Access denied'}), 403
+
+        # Load audio (mono)
+        audio, sr = librosa.load(abs_path, sr=None, mono=True)
+
+        # Create figure
+        fig = plt.figure(figsize=(8, 1.6), dpi=150)
+        ax = fig.add_subplot(111)
+        ax.plot(np.linspace(0, len(audio)/sr, num=len(audio)), audio, color='#2b6cb0', linewidth=0.8)
+        ax.set_xlim(0, len(audio)/sr)
+        ax.set_ylim(-1.0, 1.0)
+        ax.axis('off')
+        fig.tight_layout(pad=0)
+
+        # Save to buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', transparent=True)
+        plt.close(fig)
+        buf.seek(0)
+        return send_file(buf, mimetype='image/png')
+    except Exception as e:
+        print(f"Waveform error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     print("=" * 50)

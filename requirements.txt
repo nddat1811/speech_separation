@@ -41,3 +41,10 @@ tensorboard
 yamlargparse
 packaging
 ninja
+
+# Added for ASR/TTS pipeline and notebooks
+SpeechRecognition
+jiwer
+openai-whisper
+gTTS
+matplotlib

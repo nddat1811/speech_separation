@@ -273,6 +273,17 @@
             font-size: 1.1em;
         }
 
+        /* Waveform image */
+        .wave-container {
+            margin-top: 10px;
+            background: #f3f5ff;
+            border-radius: 6px;
+            border: 1px solid #e2e6ff;
+            height: 80px;
+            overflow: hidden;
+        }
+        .wave-img { width: 100%; height: 80px; object-fit: cover; display: block; }
+
         audio {
             width: 100%;
             height: 40px;
@@ -411,15 +422,12 @@
                     <h3 style="text-align: center; color: #495057; margin-bottom: 20px;">Kết quả tách âm</h3>
                     <div class="results-grid">
                         <div class="results-col" id="inputCol">
-                            <h3>Input</h3>
                             <div id="inputAudio"></div>
                         </div>
                         <div class="results-col" id="leftOutputCol">
-                            <h3>Speaker 1</h3>
                             <div id="leftOutput"></div>
                         </div>
                         <div class="results-col" id="rightOutputCol">
-                            <h3>Speaker 2</h3>
                             <div id="rightOutput"></div>
                         </div>
                     </div>
@@ -674,6 +682,7 @@
                         <source src="${inputUrl}" type="audio/wav">
                         <source src="${inputUrl}" type="audio/mpeg">
                     </audio>
+                    <div class="wave-container"><img class="wave-img" id="inputWave" alt="waveform"></div>
                     <br>
                     <a href="${inputUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
                 `;
@@ -684,8 +693,10 @@
             data.files.forEach((file, index) => {
                 const audioDiv = document.createElement('div');
                 audioDiv.className = 'audio-player';
-                const filePath = data.file_paths ? data.file_paths[index] : `${data.temp_dir}/separated_speaker_${index + 1}.wav`;
+                const filePath = data.file_paths ? data.file_paths[index] : `separated_speaker_${index + 1}.wav`;
+                const relPath = data.temp_dir ? `${data.temp_dir}/${filePath}` : filePath;
                 const downloadUrl = `/download/${filePath}`;
+                const waveId = `wave_${index}`;
                 audioDiv.innerHTML = `
                     <h4>Speaker ${index + 1}</h4>
                     <p style="font-size: 0.8em; color: #666;">File: ${filePath}</p>
@@ -693,17 +704,40 @@
                         <source src="${downloadUrl}" type="audio/wav">
                         <source src="${downloadUrl}" type="audio/mpeg">
                     </audio>
+                    <div class="wave-container"><img class="wave-img" id="${waveId}" alt="waveform"></div>
                     <br>
                     <a href="${downloadUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
                 `;
+                // Append transcript if available
+                if (data.transcripts && data.transcripts[index]) {
+                    const p = document.createElement('p');
+                    p.style = 'margin-top:8px; font-size: 0.95em; color:#495057;'
+                    p.textContent = `📝 ${data.transcripts[index]}`;
+                    audioDiv.appendChild(p);
+                }
                 if (index === 0) {
                     leftOutput.appendChild(audioDiv);
                 } else {
                     rightOutput.appendChild(audioDiv);
                 }
+
+                // Draw waveform for each output
+                setTimeout(() => setWaveSrc(relPath, document.getElementById(waveId)), 0);
             });
             
+            // Draw input waveform
+            if (data.input_file_path) {
+                const inputImg = document.getElementById('inputWave');
+                if (inputImg) setTimeout(() => setWaveSrc(data.input_file_path, inputImg), 0);
+            }
+
             results.style.display = 'block';
+        }
+
+        function setWaveSrc(relativePath, imgEl){
+            if (!imgEl) return;
+            // relativePath example: outputs/try/output/file.wav
+            imgEl.src = `/waveform/${relativePath}`;
         }
 
         function showError(message) {
