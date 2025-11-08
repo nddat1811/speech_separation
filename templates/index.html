@@ -19,12 +19,93 @@
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1800px;
             margin: 0 auto;
             background: white;
             border-radius: 15px;
             box-shadow: 0 20px 40px rgba(0,0,0,0.1);
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 40px);
+        }
+        
+        .main-layout {
+            display: flex;
+            flex: 1;
+        }
+        
+        .sidebar {
+            width: 320px;
+            background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
+            padding: 20px 0;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .sidebar h3 {
+            color: white;
+            padding: 0 20px;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .model-menu {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        
+        .model-menu-item {
+            padding: 15px 20px;
+            color: rgba(255, 255, 255, 0.8);
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border-left: 3px solid transparent;
+            margin: 5px 0;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .model-menu-item .model-name {
+            font-weight: 500;
+        }
+        
+        .model-menu-item .model-info {
+            font-size: 0.85em;
+            color: rgba(255, 255, 255, 0.7);
+            font-weight: 400;
+        }
+        
+        .model-menu-item.active .model-info {
+            color: rgba(255, 255, 255, 0.9);
+        }
+        
+        .model-menu-item:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: white;
+        }
+        
+        .model-menu-item.active {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border-left: 3px solid white;
+            font-weight: 600;
+        }
+        
+        .model-menu-item.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
         }
 
         .header {
@@ -73,6 +154,22 @@
         .tab:hover {
             background: #e9ecef;
         }
+        
+        .model-indicator {
+            background: rgba(102, 126, 234, 0.1);
+            padding: 10px 20px;
+            border-bottom: 1px solid #dee2e6;
+            color: #667eea;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .model-indicator::before {
+            content: "🎯";
+            font-size: 1.2em;
+        }
 
         .tab-content {
             display: none;
@@ -88,7 +185,7 @@
             text-align: center;
             margin-bottom: 40px;
         }
-
+        
         .upload-area {
             border: 3px dashed #667eea;
             border-radius: 15px;
@@ -360,6 +457,26 @@
                 border-radius: 10px;
             }
             
+            .main-layout {
+                flex-direction: column;
+            }
+            
+            .sidebar {
+                width: 100%;
+                padding: 10px 0;
+            }
+            
+            .model-menu {
+                display: flex;
+                overflow-x: auto;
+            }
+            
+            .model-menu-item {
+                white-space: nowrap;
+                padding: 10px 15px;
+                margin: 0 5px;
+            }
+            
             .header h1 {
                 font-size: 2em;
             }
@@ -380,11 +497,35 @@
             <h1>Audio Source Separation</h1>
             <p>Tách âm thanh từ hỗn hợp nhiều người nói</p>
         </div>
-
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('experience')">Trải nghiệm</button>
-            <button class="tab" onclick="switchTab('demo')">Demo</button>
-        </div>
+        
+        <div class="main-layout">
+            <div class="sidebar">
+                <h3>Chọn Model</h3>
+                <ul class="model-menu" id="modelMenu">
+                    <li class="model-menu-item active" data-model="clean" onclick="selectModel('clean')">
+                        <span class="model-name">Clean</span>
+                        <span class="model-info" id="model-info-clean"></span>
+                    </li>
+                    <li class="model-menu-item" data-model="finetune" onclick="selectModel('finetune')">
+                        <span class="model-name">Finetune</span>
+                        <span class="model-info" id="model-info-finetune"></span>
+                    </li>
+                    <li class="model-menu-item" data-model="noise" onclick="selectModel('noise')">
+                        <span class="model-name">Noise</span>
+                        <span class="model-info" id="model-info-noise"></span>
+                    </li>
+                </ul>
+            </div>
+            
+            <div class="main-content">
+                <div class="model-indicator" id="modelIndicator">
+                    Đang sử dụng model: <strong id="currentModel">Clean</strong>
+                </div>
+                
+                <div class="tabs">
+                    <button class="tab active" onclick="switchTab('experience')">Trải nghiệm</button>
+                    <button class="tab" onclick="switchTab('demo')">Demo</button>
+                </div>
 
         <!-- Tab 1: Experience -->
         <div id="experience" class="tab-content active">
@@ -438,13 +579,9 @@
         <!-- Tab 2: Demo -->
         <div id="demo" class="tab-content">
             <div class="demo-section">
-                <h3>WSJO_MIX</h3>
-                <div class="demo-grid" id="wsjoDemo"></div>
+                <div id="demoContainer"></div>
             </div>
-            
-            <div class="demo-section">
-                <h3>WHAM</h3>
-                <div class="demo-grid" id="whamDemo"></div>
+        </div>
             </div>
         </div>
     </div>
@@ -453,7 +590,128 @@
         let isRecording = false;
         let mediaRecorder = null;
         let audioChunks = [];
+        let currentModelType = 'clean';
+        let availableModels = [];
+        let modelsInfo = {}; // Store model info (epoch, sidr)
 
+        // Load available models on page load
+        window.addEventListener('DOMContentLoaded', function() {
+            loadAvailableModels();
+        });
+
+        function loadAvailableModels() {
+            fetch('/models')
+                .then(response => response.json())
+                .then(data => {
+                    availableModels = data.available_models || [];
+                    modelsInfo = data.models_info || {};
+                    console.log('Available models loaded:', availableModels);
+                    console.log('Models info:', modelsInfo);
+                    updateModelMenu();
+                    // Set default model to first available
+                    if (availableModels.length > 0) {
+                        currentModelType = availableModels[0];
+                        selectModel(currentModelType);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error loading models:', error);
+                    // Default to clean if API fails
+                    availableModels = ['clean'];
+                    modelsInfo = {};
+                    updateModelMenu();
+                    if (availableModels.length > 0) {
+                        currentModelType = availableModels[0];
+                        selectModel(currentModelType);
+                    }
+                });
+        }
+
+        function updateModelMenu() {
+            // Update sidebar menu with SIDR info
+            const menuItems = document.querySelectorAll('.model-menu-item');
+            menuItems.forEach(item => {
+                const modelType = item.getAttribute('data-model');
+                const infoElement = document.getElementById(`model-info-${modelType}`);
+                
+                if (availableModels.includes(modelType)) {
+                    item.classList.remove('disabled');
+                    
+                    // Update model info (SIDR)
+                    const info = modelsInfo[modelType] || {};
+                    if (infoElement) {
+                        let infoText = '';
+                        if (info.sidr !== null && info.sidr !== undefined) {
+                            infoText = `SIDR: ${info.sidr.toFixed(2)} dB`;
+                        }
+                        if (info.epoch !== null && info.epoch !== undefined) {
+                            if (infoText) infoText += ` | Epoch: ${info.epoch}`;
+                            else infoText = `Epoch: ${info.epoch}`;
+                        }
+                        infoElement.textContent = infoText;
+                    }
+                } else {
+                    item.classList.add('disabled');
+                    if (infoElement) {
+                        infoElement.textContent = '';
+                    }
+                }
+            });
+        }
+
+        function selectModel(modelType) {
+            console.log('selectModel called with:', modelType);
+            console.log('Available models:', availableModels);
+            
+            // Check if model is available
+            if (!availableModels.includes(modelType)) {
+                console.warn(`Model "${modelType}" not in available models:`, availableModels);
+                alert(`Model "${modelType}" chưa được load. Vui lòng chọn model khác.\n\nModels có sẵn: ${availableModels.join(', ')}`);
+                return;
+            }
+            
+            currentModelType = modelType;
+            console.log('Model selected:', currentModelType);
+            
+            // Update UI - sidebar menu
+            document.querySelectorAll('.model-menu-item').forEach(item => {
+                item.classList.remove('active');
+                if (item.getAttribute('data-model') === modelType) {
+                    item.classList.add('active');
+                    console.log('Activated menu item for:', modelType);
+                }
+            });
+            
+            // Update indicator with model name, epoch, and SIDR
+            const modelNames = {
+                'clean': 'Clean',
+                'finetune': 'Finetune',
+                'noise': 'Noise'
+            };
+            const modelIndicator = document.getElementById('modelIndicator');
+            if (modelIndicator) {
+                let indicatorText = `Đang sử dụng model: <strong>${modelNames[modelType] || modelType}</strong>`;
+                
+                // Get model info
+                const info = modelsInfo[modelType] || {};
+                const parts = [];
+                
+                if (info.epoch !== null && info.epoch !== undefined) {
+                    parts.push(`Epoch: ${info.epoch}`);
+                }
+                
+                if (info.sidr !== null && info.sidr !== undefined) {
+                    parts.push(`SIDR: ${info.sidr.toFixed(2)} dB`);
+                }
+                
+                if (parts.length > 0) {
+                    indicatorText += ` <span style="color: #6c757d; font-size: 0.9em;">(${parts.join(', ')})</span>`;
+                }
+                
+                modelIndicator.innerHTML = indicatorText;
+            }
+        }
+        
         function switchTab(tabName) {
             // Hide all tab contents
             document.querySelectorAll('.tab-content').forEach(content => {
@@ -491,6 +749,9 @@
             } else {
                 formData.append('file', file);
             }
+            
+            // Add model_type to form data
+            formData.append('model_type', currentModelType);
             
             showProcessing(true);
             
@@ -764,54 +1025,149 @@
         }
 
         function displayDemoFiles(files) {
-            const wsjoDemo = document.getElementById('wsjoDemo');
-            const whamDemo = document.getElementById('whamDemo');
+            const demoContainer = document.getElementById('demoContainer');
             
-            wsjoDemo.innerHTML = '';
-            whamDemo.innerHTML = '';
+            if (!demoContainer) {
+                console.error('Demo container not found');
+                return;
+            }
             
-            files.forEach(file => {
-                const demoItem = document.createElement('div');
-                demoItem.className = 'demo-item';
+            demoContainer.innerHTML = '';
+            
+            if (!files || files.length === 0) {
+                demoContainer.innerHTML = '<div class="error">Chưa có file demo nào</div>';
+                return;
+            }
+            
+            files.forEach((file, index) => {
+                // Create demo entry container
+                const demoEntry = document.createElement('div');
+                demoEntry.className = 'demo-entry';
+                demoEntry.style.cssText = 'margin-bottom: 40px; padding: 20px; background: #f8f9fa; border-radius: 10px;';
                 
-                let content = `<h4>${file.name}</h4>`;
+                // Header - ALWAYS show gender label only (never model type like "Finetune")
+                const headerDiv = document.createElement('div');
+                headerDiv.style.cssText = 'margin-bottom: 20px; padding-bottom: 10px; border-bottom: 2px solid #667eea;';
+                // ALWAYS use gender_label_with_tv first, then gender_label
+                // NEVER use header if it's a model type (Clean, Finetune, Noise)
+                let displayHeader = 'Demo';
                 
-                if (file.before) {
-                    content += `
-                        <div class="demo-audio">
-                            <h5>Original Audio - Mixed</h5>
-                            <audio controls>
-                                <source src="/download/${file.before}" type="audio/wav">
+                // Priority 1: Use gender_label_with_tv (includes TV if Vietnamese)
+                if (file.gender_label_with_tv) {
+                    displayHeader = file.gender_label_with_tv;
+                }
+                // Priority 2: Use gender_label and add TV if Vietnamese
+                else if (file.gender_label) {
+                    displayHeader = file.is_vietnamese ? `${file.gender_label} TV` : file.gender_label;
+                }
+                // Priority 3: Use header ONLY if it's NOT a model type
+                else if (file.header) {
+                    const modelTypes = ['Clean', 'Finetune', 'Noise'];
+                    const isModelType = modelTypes.some(mt => 
+                        file.header === mt || 
+                        file.header.startsWith(mt + ' ') || 
+                        file.header.startsWith('TV - ' + mt) ||
+                        file.header.includes(mt)
+                    );
+                    if (!isModelType) {
+                        displayHeader = file.header;
+                    }
+                }
+                headerDiv.innerHTML = `
+                    <h4 style="color: #495057; margin: 0; font-size: 1.3em;">${displayHeader}</h4>
+                `;
+                demoEntry.appendChild(headerDiv);
+                
+                // Create 3-column layout (same as results grid)
+                const resultsGrid = document.createElement('div');
+                resultsGrid.className = 'results-grid';
+                resultsGrid.style.cssText = 'display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;';
+                
+                // Input column
+                const inputCol = document.createElement('div');
+                inputCol.className = 'results-col';
+                if (file.input_file) {
+                    const inputPath = `${file.input_dir}/${file.input_file}`;
+                    const inputDownloadPath = file.input_file; // Will be resolved by download endpoint
+                    inputCol.innerHTML = `
+                        <div class="audio-player">
+                            <h4>Input</h4>
+                            <p style="font-size: 0.8em; color: #666;">File: ${file.input_file}</p>
+                            <audio controls preload="metadata">
+                                <source src="/download/${inputDownloadPath}" type="audio/wav">
                             </audio>
+                            <div class="wave-container">
+                                <img class="wave-img" id="demo-input-wave-${index}" alt="waveform">
+                            </div>
+                            <br>
+                            <a href="/download/${inputDownloadPath}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
                         </div>
                     `;
+                    setTimeout(() => setWaveSrc(inputPath, document.getElementById(`demo-input-wave-${index}`)), 0);
                 }
                 
-                if (file.after) {
-                    content += `
-                        <div class="demo-audio">
-                            <h5>Separated Audio</h5>
-                            <audio controls>
-                                <source src="/download/${file.after}" type="audio/wav">
+                // Speaker 1 column
+                const speaker1Col = document.createElement('div');
+                speaker1Col.className = 'results-col';
+                if (file.speaker_files && file.speaker_files[0]) {
+                    const speaker1Path = `${file.output_dir}/${file.speaker_files[0]}`;
+                    const speaker1DownloadPath = file.speaker_files[0]; // Will be resolved by download endpoint
+                    speaker1Col.innerHTML = `
+                        <div class="audio-player">
+                            <h4>Speaker 1</h4>
+                            <p style="font-size: 0.8em; color: #666;">File: ${file.speaker_files[0]}</p>
+                            <audio controls preload="metadata">
+                                <source src="/download/${speaker1DownloadPath}" type="audio/wav">
                             </audio>
+                            <div class="wave-container">
+                                <img class="wave-img" id="demo-speaker1-wave-${index}" alt="waveform">
+                            </div>
+                            <br>
+                            <a href="/download/${speaker1DownloadPath}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
+                            ${file.transcripts && file.transcripts[0] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[0]}</p>` : ''}
                         </div>
                     `;
+                    setTimeout(() => setWaveSrc(speaker1Path, document.getElementById(`demo-speaker1-wave-${index}`)), 0);
                 }
                 
-                demoItem.innerHTML = content;
+                // Speaker 2 column
+                const speaker2Col = document.createElement('div');
+                speaker2Col.className = 'results-col';
+                if (file.speaker_files && file.speaker_files[1]) {
+                    const speaker2Path = `${file.output_dir}/${file.speaker_files[1]}`;
+                    const speaker2DownloadPath = file.speaker_files[1]; // Will be resolved by download endpoint
+                    speaker2Col.innerHTML = `
+                        <div class="audio-player">
+                            <h4>Speaker 2</h4>
+                            <p style="font-size: 0.8em; color: #666;">File: ${file.speaker_files[1]}</p>
+                            <audio controls preload="metadata">
+                                <source src="/download/${speaker2DownloadPath}" type="audio/wav">
+                            </audio>
+                            <div class="wave-container">
+                                <img class="wave-img" id="demo-speaker2-wave-${index}" alt="waveform">
+                            </div>
+                            <br>
+                            <a href="/download/${speaker2DownloadPath}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
+                            ${file.transcripts && file.transcripts[1] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[1]}</p>` : ''}
+                        </div>
+                    `;
+                    setTimeout(() => setWaveSrc(speaker2Path, document.getElementById(`demo-speaker2-wave-${index}`)), 0);
+                }
                 
-                // Add to both sections for now (you can modify this logic)
-                wsjoDemo.appendChild(demoItem.cloneNode(true));
-                whamDemo.appendChild(demoItem.cloneNode(true));
+                resultsGrid.appendChild(inputCol);
+                resultsGrid.appendChild(speaker1Col);
+                resultsGrid.appendChild(speaker2Col);
+                
+                demoEntry.appendChild(resultsGrid);
+                demoContainer.appendChild(demoEntry);
             });
         }
 
         function showDemoError(message) {
-            const wsjoDemo = document.getElementById('wsjoDemo');
-            const whamDemo = document.getElementById('whamDemo');
-            
-            wsjoDemo.innerHTML = `<div class="error">${message}</div>`;
-            whamDemo.innerHTML = `<div class="error">${message}</div>`;
+            const demoContainer = document.getElementById('demoContainer');
+            if (demoContainer) {
+                demoContainer.innerHTML = `<div class="error">${message}</div>`;
+            }
         }
 
         // Drag and drop functionality
