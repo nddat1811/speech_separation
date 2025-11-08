@@ -282,7 +282,11 @@ def process_audio_file(input_path, output_dir, output_prefix=None, model_type='c
             if isinstance(output_audio, torch.Tensor):
                 output_audio = output_audio.cpu().numpy()
             
-            output_filename = f"{base_name}_{model_type}_s{spk+1}.wav"
+            # Add "FT" suffix for finetune model
+            if model_type == 'finetune':
+                output_filename = f"{base_name}_{model_type}_s{spk+1}_FT.wav"
+            else:
+                output_filename = f"{base_name}_{model_type}_s{spk+1}.wav"
             output_path = os.path.join(output_dir, output_filename)
             
             sf.write(output_path, output_audio, args.sampling_rate)
@@ -446,10 +450,19 @@ def download_file(filename):
 
 @app.route('/demo_files')
 def demo_files():
-    """Return demo files - one most recent file for each gender combination type"""
+    """Return demo files - one most recent file for each gender combination type
+    Query parameter: model_type (optional) - if provided, only return files from that model
+    """
     try:
+        # Get model_type from query parameter (if provided)
+        requested_model_type = request.args.get('model_type', None)
+        
         all_files = []
-        model_types = ['clean', 'noise', 'finetune']
+        # If model_type is specified, only process that model; otherwise process all
+        if requested_model_type and requested_model_type in ['clean', 'noise', 'finetune']:
+            model_types = [requested_model_type]
+        else:
+            model_types = ['clean', 'noise', 'finetune']
         
         # Collect all output files with their metadata
         for model_type in model_types:
@@ -461,17 +474,35 @@ def demo_files():
             
             # Get all speaker files (s1, s2)
             for filename in os.listdir(output_dir):
-                if filename.endswith('.wav') and ('_s1.wav' in filename or '_s2.wav' in filename):
-                    # Extract base name (remove _model_type_s1.wav or _model_type_s2.wav)
+                if filename.endswith('.wav') and ('_s1.wav' in filename or '_s2.wav' in filename or '_s1_FT.wav' in filename or '_s2_FT.wav' in filename):
+                    # Extract base name (remove _model_type_s1.wav, _model_type_s2.wav, or _model_type_s1_FT.wav, _model_type_s2_FT.wav)
                     # Format: base_timestamp_model_type_s1.wav -> base_timestamp.wav
+                    # Format: base_timestamp_model_type_s1_FT.wav -> base_timestamp.wav (for finetune)
                     base_match = filename
                     for mt in model_types:
-                        if f'_{mt}_s1.wav' in filename:
-                            base_match = filename.replace(f'_{mt}_s1.wav', '.wav')
-                            break
-                        elif f'_{mt}_s2.wav' in filename:
-                            base_match = filename.replace(f'_{mt}_s2.wav', '.wav')
-                            break
+                        # Handle finetune files with _FT suffix
+                        if mt == 'finetune':
+                            if f'_{mt}_s1_FT.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s1_FT.wav', '.wav')
+                                break
+                            elif f'_{mt}_s2_FT.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s2_FT.wav', '.wav')
+                                break
+                            # Also handle old finetune files without _FT (backward compatibility)
+                            elif f'_{mt}_s1.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s1.wav', '.wav')
+                                break
+                            elif f'_{mt}_s2.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s2.wav', '.wav')
+                                break
+                        else:
+                            # Handle other model types (clean, noise)
+                            if f'_{mt}_s1.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s1.wav', '.wav')
+                                break
+                            elif f'_{mt}_s2.wav' in filename:
+                                base_match = filename.replace(f'_{mt}_s2.wav', '.wav')
+                                break
                     
                     # Find corresponding input file
                     input_file = base_match if base_match != filename else None
@@ -512,8 +543,11 @@ def demo_files():
             if len(files) < 2:  # Need at least s1 and s2
                 continue
             
-            # Sort files to ensure s1 comes before s2
-            files_sorted = sorted(files, key=lambda x: ('_s2.wav' in x['filename'], x['timestamp']))
+            # Sort files to ensure s1 comes before s2 (handle both regular and _FT suffix)
+            files_sorted = sorted(files, key=lambda x: (
+                '_s2_FT.wav' in x['filename'] or '_s2.wav' in x['filename'], 
+                x['timestamp']
+            ))
             
             # Try to detect gender from filename first (faster)
             base_name = files[0]['base_name'].lower()
@@ -547,7 +581,7 @@ def demo_files():
                 is_vietnamese = False
                 
                 for file_info in files_sorted:
-                    if '_s1.wav' in file_info['filename'] or '_s2.wav' in file_info['filename']:
+                    if '_s1_FT.wav' in file_info['filename'] or '_s1.wav' in file_info['filename'] or '_s2_FT.wav' in file_info['filename'] or '_s2.wav' in file_info['filename']:
                         speaker_path = file_info['file_path']
                         try:
                             transcript = transcribe_audio_vi(speaker_path)
@@ -583,12 +617,12 @@ def demo_files():
             # Get input file from any file in the group
             input_file = files[0].get('input_file')
             
-            # Collect speaker files
+            # Collect speaker files (handle both regular and _FT suffix for finetune)
             speaker_files = []
             for file_info in files_sorted:
-                if '_s1.wav' in file_info['filename']:
+                if '_s1_FT.wav' in file_info['filename'] or '_s1.wav' in file_info['filename']:
                     speaker_files.insert(0, file_info['filename'])  # s1 first
-                elif '_s2.wav' in file_info['filename']:
+                elif '_s2_FT.wav' in file_info['filename'] or '_s2.wav' in file_info['filename']:
                     speaker_files.append(file_info['filename'])  # s2 second
             
             if len(speaker_files) < 2:

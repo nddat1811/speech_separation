@@ -710,6 +710,12 @@
                 
                 modelIndicator.innerHTML = indicatorText;
             }
+            
+            // Reload demo data if currently on demo tab
+            const demoTab = document.getElementById('demo');
+            if (demoTab && demoTab.classList.contains('active')) {
+                loadDemoData(modelType);
+            }
         }
         
         function switchTab(tabName) {
@@ -729,9 +735,9 @@
             // Add active class to clicked tab
             event.target.classList.add('active');
             
-            // Load demo data if switching to demo tab
+            // Load demo data if switching to demo tab (use current selected model)
             if (tabName === 'demo') {
-                loadDemoData();
+                loadDemoData(currentModelType || 'clean');
             }
         }
 
@@ -1009,8 +1015,10 @@
             results.style.display = 'block';
         }
 
-        function loadDemoData() {
-            fetch('/demo_files')
+        function loadDemoData(modelType) {
+            // Use currentModelType if modelType is not provided
+            const model = modelType || currentModelType || 'clean';
+            fetch(`/demo_files?model_type=${model}`)
             .then(response => response.json())
             .then(data => {
                 if (data.demo_files) {
