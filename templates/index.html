@@ -976,12 +976,13 @@
                     <a href="${downloadUrl}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
                 `;
                 // Append transcript if available
-                if (data.transcripts && data.transcripts[index]) {
-                    const p = document.createElement('p');
-                    p.style = 'margin-top:8px; font-size: 0.95em; color:#495057;'
-                    p.textContent = `📝 ${data.transcripts[index]}`;
-                    audioDiv.appendChild(p);
-                }
+                // COMMENTED OUT: Hide transcript display (can uncomment to show again)
+                // if (data.transcripts && data.transcripts[index]) {
+                //     const p = document.createElement('p');
+                //     p.style = 'margin-top:8px; font-size: 0.95em; color:#495057;'
+                //     p.textContent = `📝 ${data.transcripts[index]}`;
+                //     audioDiv.appendChild(p);
+                // }
                 if (index === 0) {
                     leftOutput.appendChild(audioDiv);
                 } else {
@@ -1132,7 +1133,8 @@
                             </div>
                             <br>
                             <a href="/download/${speaker1DownloadPath}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
-                            ${file.transcripts && file.transcripts[0] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[0]}</p>` : ''}
+                            <!-- COMMENTED OUT: Hide transcript display (can uncomment to show again) -->
+                            <!-- ${file.transcripts && file.transcripts[0] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[0]}</p>` : ''} -->
                         </div>
                     `;
                     setTimeout(() => setWaveSrc(speaker1Path, document.getElementById(`demo-speaker1-wave-${index}`)), 0);
@@ -1156,7 +1158,8 @@
                             </div>
                             <br>
                             <a href="/download/${speaker2DownloadPath}" download style="color: #667eea; text-decoration: none;">📥 Tải xuống</a>
-                            ${file.transcripts && file.transcripts[1] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[1]}</p>` : ''}
+                            <!-- COMMENTED OUT: Hide transcript display (can uncomment to show again) -->
+                            <!-- ${file.transcripts && file.transcripts[1] ? `<p style="margin-top:8px; font-size: 0.95em; color:#495057;">📝 ${file.transcripts[1]}</p>` : ''} -->
                         </div>
                     `;
                     setTimeout(() => setWaveSrc(speaker2Path, document.getElementById(`demo-speaker2-wave-${index}`)), 0);
