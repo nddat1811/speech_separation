@@ -1,94 +1,62 @@
 # Audio Source Separation Web App
 
-Ứng dụng web để tách giọng nói từ hỗn hợp nhiều người nói sử dụng MossFormer2.
+Ứng dụng web tách hai giọng nói từ cùng một bản ghi bằng mô hình MossFormer2, tối ưu cho CPU.
 
-## Cài đặt và chạy
+## Cách cài đặt
 
-### Cách 1: Sử dụng script tự động (Khuyến nghị)
-
+### 1. Script tự động (khuyên dùng)
 ```bash
 chmod +x run_cpu_only.sh
 ./run_cpu_only.sh
 ```
+Script sẽ tạo virtual env, cài toàn bộ dependency (bao gồm PyTorch CPU), chạy kiểm tra nhanh và khởi động web app.
 
-Script này sẽ:
-1. Tạo virtual environment
-2. Cài đặt các dependencies cần thiết
-3. Cài đặt PyTorch CPU version
-4. Test dependencies
-5. Chạy web app
-
-### Cách 2: Cài đặt thủ công
-
-1. Tạo virtual environment:
+### 2. Thiết lập thủ công
+1. Tạo và kích hoạt virtual env  
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # Linux/Mac
-# hoặc
-venv\Scripts\activate    # Windows
+source venv/bin/activate      # Linux/Mac
+venv\Scripts\activate         # Windows
 ```
-
-2. Cài đặt dependencies:
+2. Cài đặt gói cần thiết  
 ```bash
 pip install -r requirements.txt
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 ```
-
-3. Chạy ứng dụng:
+3. Chạy server  
 ```bash
 python app.py
 ```
 
-## Sử dụng
+## Hướng dẫn sử dụng
+1. Mở trình duyệt tới `http://localhost:5000`
+2. Chọn tab **Trải nghiệm**
+3. Tải lên file WAV/MP3/FLAC/M4A (≤16MB) hoặc thu âm trực tiếp
+4. Nhấn xử lý, đợi hệ thống tách giọng
+5. Nghe thử và tải về từng kênh giọng nói
 
-1. Mở trình duyệt và truy cập `http://localhost:5000`
-2. Chọn tab "Trải nghiệm"
-3. Upload file âm thanh hoặc thu âm từ microphone
-4. Chờ quá trình xử lý hoàn tất
-5. Nghe và tải xuống các file âm thanh đã tách
+## Tính năng chính
+- Upload file âm thanh nhiều định dạng
+- Thu âm từ microphone
+- Tách 2 giọng bằng MossFormer2 (8 kHz)
+- Bộ demo mẫu sẵn để thử nhanh
 
-## Tính năng
-
-- **Upload file**: Hỗ trợ WAV, MP3, FLAC, M4A (tối đa 16MB)
-- **Thu âm**: Ghi âm trực tiếp từ microphone
-- **Tách giọng**: Sử dụng MossFormer2 để tách 2 giọng nói
-- **Demo**: Có sẵn các file demo để thử nghiệm
-
-## Cấu trúc thư mục
-
+## Cấu trúc thư mục đầu ra
 ```
 outputs/
 ├── try/
-│   ├── input/     # File âm thanh đầu vào
-│   └── output/    # File âm thanh đã tách
-└── MossFormer2_SS_8K/  # File demo
+│   ├── input/      # file do người dùng tải lên
+│   └── output/     # kết quả đã tách
+└── MossFormer2_SS_8K/  # bộ demo
 ```
 
 ## Yêu cầu hệ thống
+- Python 3.8 trở lên
+- RAM tối thiểu 4 GB (8 GB+ sẽ ổn định hơn)
+- CPU bất kỳ, không cần GPU
+- Trống khoảng 2 GB cho model + dependency
 
-- Python 3.8+
-- RAM: Tối thiểu 4GB (khuyến nghị 8GB+)
-- CPU: Bất kỳ (chạy trên CPU)
-- Disk: ~2GB cho model và dependencies
-
-## Xử lý sự cố
-
-### Lỗi "Model not found"
-- Kiểm tra xem có file checkpoint trong `checkpoints/Libri2Mix_min_adam/MossFormer2_SS_8K_clean/`
-- Đảm bảo có file `last_best_checkpoint` hoặc `last_checkpoint`
-
-### Lỗi "CUDA out of memory"
-- Ứng dụng được cấu hình để chạy trên CPU
-- Nếu vẫn gặp lỗi, kiểm tra RAM có đủ không
-
-### Lỗi import
-- Chạy `python test_deps.py` để kiểm tra dependencies
-- Cài đặt lại các package bị thiếu
-
-## API Endpoints
-
-- `GET /`: Trang chủ
-- `POST /upload`: Upload và xử lý file âm thanh
-- `GET /download/<filename>`: Tải file âm thanh
-- `GET /demo_files`: Lấy danh sách file demo
-- `GET /health`: Kiểm tra trạng thái ứng dụng
+## Khắc phục sự cố
+- **Model not found**: kiểm tra `checkpoints/Libri2Mix_min_adam/MossFormer2_SS_8K_clean/` phải có `last_best_checkpoint` hoặc `last_checkpoint`.
+- **CUDA out of memory**: app chạy trên CPU, nếu vẫn báo lỗi hãy kiểm tra lại RAM.
+- **Lỗi import**: chạy `python test_deps.py` để xác nhận dependency, sau đó cài lại gói thiếu.
