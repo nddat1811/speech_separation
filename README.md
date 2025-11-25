@@ -13,7 +13,7 @@ project-root/
 ├─ data/                  # metadata, file scp
 ├─ dataloader/            # PyTorch dataset + loader
 ├─ dataset/               # chứa dữ liệu gốc để train
-├─ losses/                # hàm loss (SDR, SI-SNR,…)
+├─ losses/                # hàm loss (SDR, SI-SDR,…)
 ├─ models/                # kiến trúc mô hình MossFormer2
 │  └─ mossformer2/        # implementation chi tiết
 │     ├─ mossformer2.py   # MossFormer2_SS, Encoder, Decoder, MossFormer
