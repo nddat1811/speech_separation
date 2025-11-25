@@ -1,15 +1,29 @@
 #!/bin/sh
 
-gpu_id=4,6				# visible GPUs
-n_gpu=2		# number of GPU used for training
-network=MossFormer2_SS_16K
-checkpoint_dir=checkpoints/$network						# leave empty if it's a new training, otherwise provide the 'log_name'
-config_pth=config/train/${network}.yaml		# the config file, only used if it's a new training
-train_from_last_checkpoint=0 #resume training from last checkpoint, 1 for true, 0 for false.
-init_checkpoint_path=../../clearvoice/checkpoints/${network}/last_best_checkpoint.pt  #we support initialize a model from previous checkpoint or pretrained model. Provide the model path here (eg. ../../clearvoice/checkpoints/${network}/last_best_checkpoint.pt), otherwise set to None.
+# Usage:
+#   bash train_new.sh <data_type> <network> <dataset_name>
+# Example:
+#   bash train_new.sh clean MossFormer2_SS_8K Libri2mix_8min
+#
+#   <data_type>: clean | noise
+#   <network>:   MossFormer2_SS_16K | MossFormer2_SS_8K
+#   <dataset_name>: tên dataset (ví dụ: Libri2mix_8min)
 
-print_freq=10  # No. steps waited for printing info
-checkpoint_save_freq=5000  #No. steps waited for saving new checkpoint
+gpu_id=0                                # visible GPUs
+n_gpu=1                                 # number of GPUs used for training
+
+# Nhận 3 tham số từ command line
+data_type=$1        # clean hoặc noise
+network=$2          # MossFormer2_SS_16K hoặc MossFormer2_SS_8K
+dataset_name=$3     # ví dụ: Libri2mix
+# Ví dụ !bash train.sh clean MossFormer2_SS_16K Libri2mix
+checkpoint_dir=checkpoints/${dataset_name}/${network}_${data_type}  # nơi lưu checkpoint
+config_pth=config/train/${network}.yaml
+train_from_last_checkpoint=1
+init_checkpoint_path=../../speech_separation/checkpoints/${dataset_name}/${network}_${data_type}/last_best_checkpoint.pt
+
+print_freq=300
+checkpoint_save_freq=28000
 
 if [ ! -d "${checkpoint_dir}" ]; then
   mkdir -p ${checkpoint_dir}
