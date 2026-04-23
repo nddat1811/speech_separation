@@ -65,8 +65,6 @@ class GlobalLayerNorm(nn.Module):
         # N x 1 x 1
         # cln: mean,var N x 1 x K x S
         # gln: mean,var N x 1 x 1
-        print(f"In GlobalLayerNorm, x.shape = {x.shape}")
-        print(f"In GlobalLayerNorm, x.dim() = {x.dim()}")
         if x.dim() == 3:
             mean = torch.mean(x, (1, 2), keepdim=True)
             var = torch.mean((x - mean) ** 2, (1, 2), keepdim=True)
@@ -123,8 +121,6 @@ class CumulativeLayerNorm(nn.LayerNorm):
         """
         # x: N x C x K x S or N x C x L
         # N x K x S x C
-        print(f"In CumulativeLayerNorm, x.shape = {x.shape}")
-        print(f"In CumulativeLayerNorm, x.dim() = {x.dim()}")
         if x.dim() == 4:
             x = x.permute(0, 2, 3, 1).contiguous()
             # N x K x S x C == only channel norm
@@ -143,8 +139,7 @@ class CumulativeLayerNorm(nn.LayerNorm):
 def select_norm(norm, dim, shape):
     """Just a wrapper to select the normalization type.
     """
-    print(f"In select_norm: (norm-dim-shape = {norm, dim, shape})" )
-    print(f"\n " )
+
     if norm == "gln":
         return GlobalLayerNorm(dim, shape, elementwise_affine=True)
     if norm == "cln":
@@ -187,8 +182,6 @@ class Encoder(nn.Module):
             bias=False,
         )
         self.in_channels = in_channels
-        print(f"Encoder in_channels = {in_channels}")
-        print(f"Encoder out_channels = {out_channels}")
 
     def forward(self, x):
         """Return the encoded output.
@@ -210,15 +203,9 @@ class Encoder(nn.Module):
         # B x L -> B x 1 x L
         if self.in_channels == 1:
             x = torch.unsqueeze(x, dim=1)
-        # print("Encoder_After unsqueeze x.shape = :", x.shape)
-        # print("Encoder_After unsqueeze x.dim = :", x.dim())
         # B x 1 x L -> B x N x T_out
         x = self.conv1d(x)
-        # print("Encoder_After conv1d x.shape =:", x.shape)
         x = F.relu(x)
-        # print("Encoder_After conv1d + ReLU:", x.shape, "\n")
-        # print("Encoder_After conv1d + ReLU x.dim() =:", x.dim())
-
 
         return x
 
@@ -572,7 +559,6 @@ class MossFormer_MaskNet(nn.Module):
         self.num_blocks = num_blocks
         self.norm = select_norm(norm, in_channels, 3)
         self.conv1d_encoder = nn.Conv1d(in_channels, out_channels, 1, bias=False)
-        print(f"use_global_pos_enc = {use_global_pos_enc}")
         self.use_global_pos_enc = use_global_pos_enc
 
         if self.use_global_pos_enc:
@@ -723,7 +709,6 @@ class MossFormer(nn.Module):
            stride = kernel_size//2,
            bias=False
         )
-
     def forward(self, input):
         x = self.enc(input)
         mask = self.mask_net(x)
