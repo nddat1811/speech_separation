@@ -1,0 +1,8 @@
+librosa
+torch
+soundfile
+numpy
+yamlargparse
+tensorboard
+einops
+rotary_embedding_torch

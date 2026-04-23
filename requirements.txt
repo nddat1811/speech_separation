@@ -1,8 +1,9 @@
+librosa
+soundfile
 torch>=2.0.1
 pesq==0.0.4
 pystoi==0.3.3
 scipy>=1.10.1
-soundfile==0.12.1
 torchaudio>=2.0.2
 yamlargparse==1.31.1
 torchinfo==1.8.0
@@ -16,7 +17,6 @@ museval
 resampy
 onnxruntime
 gammatone
-librosa==0.10.2.post1
 opencv-python==4.10.0.84
 mir_eval==0.7
 numpy>=1.24.3

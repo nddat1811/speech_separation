@@ -3,7 +3,8 @@ dataset/
 LibriMix/*
 LibriMix/
 *.pt
-
+.venv/
+env/
 __pycache__
 
 # Byte-compiled / optimized / DLL files

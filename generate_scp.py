@@ -2,14 +2,14 @@ import os, glob
 from pathlib import Path
 
 # ---- cấu hình ----
-ROOT = "/home/speech_separation/MiniLibriMix"   # thư mục dataset đã giải nén
+ROOT = r"C:\Users\tun\Desktop\code\speech_separation\dataset\MiniLibriMix"   # thư mục dataset đã giải nén
 USE_POSIX = True   # giữ True để luôn ra đường dẫn dạng "/" (Linux/Colab)
 
 # Tạo tất cả splits trong một lần chạy
 splits = ["train", "val", "test"]
 
 # ---- thư mục output ----
-out_dir = Path("/home/speech_separation/scpfile")  # <--- xuất ra đây
+out_dir = Path(r"C:\Users\tun\Desktop\code\speech_separation\data")  # <--- xuất ra đây
 out_dir.mkdir(parents=True, exist_ok=True)         # tạo nếu chưa có
 
 # ---- hàm tiện ích ----
@@ -28,7 +28,7 @@ for split in splits:
 
     # ---- thư mục input ----
     base = Path(ROOT) / split
-    mix_dir = base / "mix_clean"   # nếu muốn mix_both thì đổi ở đây
+    mix_dir = base / "mix_both"   # nếu muốn noise mix_both thì đổi ở đây
     s1_dir  = base / "s1"
     s2_dir  = base / "s2"
 

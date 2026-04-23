@@ -1,3 +1,17 @@
+## Chào ông Vương Tủn, đây là hướng dẫn chạy code trên máy tính của ông, chạy Git bash nhé
+python -m venv .venv
+source .venv/Scripts/activate
+
+<!-- Nếu là lần đầu chạy thì install những package này -->
+pip install -r requirement.txt   # requirement không có s nhé
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118  # Cái này để cài torch cuda nhé
+
+<!-- Trainng -->
+ bash train_new.sh noise MossFormer2_SS_8K tun_khung
+
+ <!-- Nếu gặp looxi Torch not compiled with CUDA enabled thì -->
+ python -m pip uninstall torch torchvision torchaudio -y
+ python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ## Nguồn tham khảo
 
 - [ClearerVoice-Studio](https://github.com/modelscope/ClearerVoice-Studio) - AI-Powered Speech Processing Toolkit với các mô hình pre-trained state-of-the-art cho speech enhancement, separation, và target speaker extraction.

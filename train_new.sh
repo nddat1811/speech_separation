@@ -31,13 +31,10 @@ if [ ! -d "${checkpoint_dir}" ]; then
 fi
 
 cp $config_pth $checkpoint_dir/config.yaml
-
+export USE_LIBUV=0
 export PYTHONWARNINGS="ignore"
 CUDA_VISIBLE_DEVICES="$gpu_id" \
 python -W ignore \
--m torch.distributed.launch \
---nproc_per_node=$n_gpu \
---master_port=$(date '+88%S') \
 train.py \
 --config ${config_pth} \
 --checkpoint_dir ${checkpoint_dir} \
@@ -45,4 +42,7 @@ train.py \
 --init_checkpoint_path ${init_checkpoint_path} \
 --print_freq ${print_freq} \
 --checkpoint_save_freq ${checkpoint_save_freq} 
+# --nproc_per_node=$n_gpu \
+# --master_port=$(date '+88%S') \
+# -m torch.distributed.launch \
 

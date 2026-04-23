@@ -65,6 +65,8 @@ class GlobalLayerNorm(nn.Module):
         # N x 1 x 1
         # cln: mean,var N x 1 x K x S
         # gln: mean,var N x 1 x 1
+        print(f"In GlobalLayerNorm, x.shape = {x.shape}")
+        print(f"In GlobalLayerNorm, x.dim() = {x.dim()}")
         if x.dim() == 3:
             mean = torch.mean(x, (1, 2), keepdim=True)
             var = torch.mean((x - mean) ** 2, (1, 2), keepdim=True)
@@ -121,6 +123,8 @@ class CumulativeLayerNorm(nn.LayerNorm):
         """
         # x: N x C x K x S or N x C x L
         # N x K x S x C
+        print(f"In CumulativeLayerNorm, x.shape = {x.shape}")
+        print(f"In CumulativeLayerNorm, x.dim() = {x.dim()}")
         if x.dim() == 4:
             x = x.permute(0, 2, 3, 1).contiguous()
             # N x K x S x C == only channel norm
@@ -139,7 +143,8 @@ class CumulativeLayerNorm(nn.LayerNorm):
 def select_norm(norm, dim, shape):
     """Just a wrapper to select the normalization type.
     """
-
+    print(f"In select_norm: (norm-dim-shape = {norm, dim, shape})" )
+    print(f"\n " )
     if norm == "gln":
         return GlobalLayerNorm(dim, shape, elementwise_affine=True)
     if norm == "cln":
@@ -182,6 +187,8 @@ class Encoder(nn.Module):
             bias=False,
         )
         self.in_channels = in_channels
+        print(f"Encoder in_channels = {in_channels}")
+        print(f"Encoder out_channels = {out_channels}")
 
     def forward(self, x):
         """Return the encoded output.
@@ -203,9 +210,15 @@ class Encoder(nn.Module):
         # B x L -> B x 1 x L
         if self.in_channels == 1:
             x = torch.unsqueeze(x, dim=1)
+        # print("Encoder_After unsqueeze x.shape = :", x.shape)
+        # print("Encoder_After unsqueeze x.dim = :", x.dim())
         # B x 1 x L -> B x N x T_out
         x = self.conv1d(x)
+        # print("Encoder_After conv1d x.shape =:", x.shape)
         x = F.relu(x)
+        # print("Encoder_After conv1d + ReLU:", x.shape, "\n")
+        # print("Encoder_After conv1d + ReLU x.dim() =:", x.dim())
+
 
         return x
 
@@ -296,12 +309,6 @@ class MossFormerM(nn.Module):
         the expansion factor for the linear projection in conv module
     causal: bool
         true for causal / false for non causal
-    use_denoise: bool
-        whether to use denoise layers in the Repeat R times loop
-    denoise_type: str
-        type of denoise layer ('basic' or 'adaptive')
-    denoise_config: dict
-        configuration for denoise layers
 
     Example
     -------
@@ -320,10 +327,7 @@ class MossFormerM(nn.Module):
         group_size = 256,
         query_key_dim = 128,
         expansion_factor = 4.,
-        attn_dropout = 0.1,
-        use_denoise = True,  # Always enable denoising by default
-        denoise_type = 'adaptive',
-        denoise_config = None
+        attn_dropout = 0.1
     ):
         super().__init__()
 
@@ -334,10 +338,7 @@ class MossFormerM(nn.Module):
                            query_key_dim=query_key_dim,
                            expansion_factor=expansion_factor,
                            causal=causal,
-                           attn_dropout=attn_dropout,
-                           use_denoise=use_denoise,
-                           denoise_type=denoise_type,
-                           denoise_config=denoise_config
+                           attn_dropout=attn_dropout
                               )
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
     def forward(
@@ -382,12 +383,6 @@ class MossFormerM2(nn.Module):
         the expansion factor for the linear projection in conv module
     causal: bool
         true for causal / false for non causal
-    use_denoise: bool
-        whether to use denoise layers in the Repeat R times loop
-    denoise_type: str
-        type of denoise layer ('basic' or 'adaptive')
-    denoise_config: dict
-        configuration for denoise layers
 
     Example
     -------
@@ -406,10 +401,7 @@ class MossFormerM2(nn.Module):
         group_size = 256,
         query_key_dim = 128,
         expansion_factor = 4.,
-        attn_dropout = 0.1,
-        use_denoise = True,  # Always enable denoising by default
-        denoise_type = 'adaptive',
-        denoise_config = None
+        attn_dropout = 0.1
     ):
         super().__init__()
 
@@ -420,10 +412,7 @@ class MossFormerM2(nn.Module):
                            query_key_dim=query_key_dim,
                            expansion_factor=expansion_factor,
                            causal=causal,
-                           attn_dropout=attn_dropout,
-                           use_denoise=use_denoise,
-                           denoise_type=denoise_type,
-                           denoise_config=denoise_config
+                           attn_dropout=attn_dropout
                               )
         self.norm = nn.LayerNorm(d_model, eps=1e-6)
 
@@ -483,20 +472,11 @@ class Computation_Block(nn.Module):
         out_channels,
         norm="ln",
         skip_around_intra=True,
-        use_denoise=True,  # Always enable denoising by default
-        denoise_type='adaptive',
-        denoise_config=None
     ):
         super(Computation_Block, self).__init__()
 
         ##MossFormer+: MossFormer with recurrence
-        self.intra_mdl = MossFormerM(
-            num_blocks=num_blocks, 
-            d_model=out_channels,
-            use_denoise=use_denoise,
-            denoise_type=denoise_type,
-            denoise_config=denoise_config
-        )
+        self.intra_mdl = MossFormerM(num_blocks=num_blocks, d_model=out_channels)
         ##MossFormerM2: the orignal MossFormer
         #self.intra_mdl = MossFormerM2(num_blocks=num_blocks, d_model=out_channels)
         self.skip_around_intra = skip_around_intra
@@ -586,15 +566,13 @@ class MossFormer_MaskNet(nn.Module):
         skip_around_intra=True,
         use_global_pos_enc=True,
         max_length=20000,
-        use_denoise=True,  # Always enable denoising by default
-        denoise_type='adaptive',
-        denoise_config=None
     ):
         super(MossFormer_MaskNet, self).__init__()
         self.num_spks = num_spks
         self.num_blocks = num_blocks
         self.norm = select_norm(norm, in_channels, 3)
         self.conv1d_encoder = nn.Conv1d(in_channels, out_channels, 1, bias=False)
+        print(f"use_global_pos_enc = {use_global_pos_enc}")
         self.use_global_pos_enc = use_global_pos_enc
 
         if self.use_global_pos_enc:
@@ -605,9 +583,6 @@ class MossFormer_MaskNet(nn.Module):
                     out_channels,
                     norm,
                     skip_around_intra=skip_around_intra,
-                    use_denoise=use_denoise,
-                    denoise_type=denoise_type,
-                    denoise_config=denoise_config
                 )
 
         self.conv1d_out = nn.Conv1d(
@@ -727,9 +702,6 @@ class MossFormer(nn.Module):
         skip_around_intra=True,
         use_global_pos_enc=True,
         max_length=20000,
-        use_denoise=True,  # Always enable denoising by default
-        denoise_type='adaptive',
-        denoise_config=None
     ):
         super(MossFormer, self).__init__()
         self.num_spks = num_spks
@@ -743,9 +715,6 @@ class MossFormer(nn.Module):
             skip_around_intra=skip_around_intra,
             use_global_pos_enc=use_global_pos_enc,
             max_length=max_length,
-            use_denoise=use_denoise,
-            denoise_type=denoise_type,
-            denoise_config=denoise_config
         )
         self.dec = Decoder(
            in_channels=out_channels,
@@ -754,6 +723,7 @@ class MossFormer(nn.Module):
            stride = kernel_size//2,
            bias=False
         )
+
     def forward(self, input):
         x = self.enc(input)
         mask = self.mask_net(x)
@@ -786,11 +756,6 @@ class MossFormer2_SS(nn.Module):
 
     def __init__(self, args):
         super(MossFormer2_SS, self).__init__()
-        # Enable denoise by default or from args
-        use_denoise = getattr(args, 'use_denoise', True)
-        denoise_type = getattr(args, 'denoise_type', 'adaptive')
-        denoise_config = getattr(args, 'denoise_config', None)
-        
         self.model = MossFormer(
             in_channels=args.encoder_embedding_dim,
             out_channels=args.mossformer_sequence_dim,
@@ -800,10 +765,7 @@ class MossFormer2_SS(nn.Module):
             num_spks=args.num_spks,
             skip_around_intra=True,
             use_global_pos_enc=True,
-            max_length=20000,
-            use_denoise=use_denoise,
-            denoise_type=denoise_type,
-            denoise_config=denoise_config)
+            max_length=20000)
 
     def forward(self, x):
         outputs = self.model(x)
