@@ -12,7 +12,7 @@ import os
 import sys
 sys.path.append(os.path.dirname(__file__))
 
-from dataloader.misc import read_and_config_file
+from .misc import read_and_config_file
 import librosa
 import random
 EPS = 1e-6
