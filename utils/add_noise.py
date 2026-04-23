@@ -199,4 +199,3 @@ if __name__ == '__main__':
     print('generated mix list')
     if args.generate_mix_wav:
         AddNoise(name, args.output_clean_dir, args.output_noisy_dir, num_threads=12)
-

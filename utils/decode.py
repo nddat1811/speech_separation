@@ -81,4 +81,3 @@ def decode_one_audio_mossformer2_ss(model, device, inputs, args):
     for spk in range(args.num_spks):
         out[spk] = out[spk]/max_abs
     return out
-
