@@ -472,40 +472,44 @@ class Gated_FSMN_Block_Dilated(nn.Module):
 class HybridMambaFSMN(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim)
+        
+        # Nhánh 1: Mamba xử lý phụ thuộc xa (Global)
         self.mamba = MambaBlock(d_model=dim)
-
-        self.conv = nn.Sequential(
-            nn.Conv1d(dim, dim, kernel_size=5, padding=2, groups=dim),
-            nn.SiLU()
+        
+        # Nhánh 2: Conv xử lý chi tiết cục bộ (Local) - Thay cho FSMN
+        # Dùng Depthwise Separable Conv để nhẹ và hiệu quả
+        self.local_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=dim),
+            nn.SiLU(),
+            nn.Conv1d(dim, dim, kernel_size=1),
         )
 
-        self.gate = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.Sigmoid()
-        )
-
-        self.norm2 = nn.LayerNorm(dim)
+        # Nhánh Gating để quyết định lấy bao nhiêu từ mỗi bên
+        self.gate_linear = nn.Linear(dim, dim)
+        self.sigmoid = nn.Sigmoid()
+        
+        self.proj_out = nn.Linear(dim, dim)
         self.dropout = nn.Dropout(0.1)
 
     def forward(self, x):
         residual = x
-
-        # Mamba
-        x_m = self.mamba(self.norm1(x))
-
-        # Local conv
-        x_conv = self.conv(x_m.transpose(1,2)).transpose(1,2)
-
-        # Gating (ổn định hơn)
-        gate = self.gate(x_m)
-
-        x = gate * x_m + (1 - gate) * x_conv
-
-        x = self.norm2(x)
-        x = self.dropout(x)
-
-        return x + residual
+        x = self.norm(x)
+        
+        # 1. Tính toán Mamba
+        x_mamba = self.mamba(x)
+        
+        # 2. Tính toán Local Conv (song song với Mamba)
+        x_local = self.local_conv(x.transpose(1, 2)).transpose(1, 2)
+        
+        # 3. Gating mechanism: Học cách trộn thông tin
+        # Thay vì gate cố định, ta học một trọng số dựa trên input
+        g = self.sigmoid(self.gate_linear(x))
+        
+        # Trộn thông tin: g quyết định bao nhiêu Global, (1-g) quyết định bao nhiêu Local
+        combined = g * x_mamba + (1 - g) * x_local
+        
+        return residual + self.dropout(self.proj_out(combined))
 
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
