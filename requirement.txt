@@ -6,3 +6,4 @@ yamlargparse
 tensorboard
 einops
 rotary_embedding_torch
+send2trash

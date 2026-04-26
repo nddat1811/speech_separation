@@ -22,7 +22,7 @@ config_pth=config/train/${network}.yaml
 train_from_last_checkpoint=1
 init_checkpoint_path=../../speech_separation/checkpoints/${dataset_name}/${network}_${data_type}/last_best_checkpoint.pt
 
-print_freq=300
+print_freq=100
 checkpoint_save_freq=28000
 
 if [ ! -d "${checkpoint_dir}" ]; then

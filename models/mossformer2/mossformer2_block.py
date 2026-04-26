@@ -14,6 +14,13 @@ from rotary_embedding_torch import RotaryEmbedding
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
+
+try:
+    # Newer mamba-ssm releases expose `Mamba` instead of `MambaBlock`.
+    from mamba_ssm.modules.mamba_simple import MambaBlock
+except ImportError:
+    from mamba_ssm.modules.mamba_simple import Mamba as MambaBlock
+
 # functions
 
 def identity(t, *args, **kwargs):
@@ -462,6 +469,44 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+class HybridMambaFSMN(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.mamba = MambaBlock(d_model=dim)
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=5, padding=2, groups=dim),
+            nn.SiLU()
+        )
+
+        self.gate = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Sigmoid()
+        )
+
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        residual = x
+
+        # Mamba
+        x_m = self.mamba(self.norm1(x))
+
+        # Local conv
+        x_conv = self.conv(x_m.transpose(1,2)).transpose(1,2)
+
+        # Gating (ổn định hơn)
+        gate = self.gate(x_m)
+
+        x = gate * x_m + (1 - gate) * x_conv
+
+        x = self.norm2(x)
+        x = self.dropout(x)
+
+        return x + residual
+
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
         self,
@@ -488,7 +533,12 @@ class MossformerBlock_GFSMN(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
+        # self.fsmn = nn.ModuleList([
+        #     HybridMambaFSMN(dim) for _ in range(depth)
+        # ])
+        self.fsmn = nn.ModuleList([
+            Gated_FSMN_Block_Dilated(dim) for _ in range(depth)
+        ])
         self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):

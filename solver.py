@@ -8,6 +8,7 @@ import torch.distributed as dist
 from losses.loss import loss_mossformer2_ss
 import logging
 import glob, re
+from send2trash import send2trash
 
 class Solver(object):
     def __init__(self, args, model, optimizer, train_data, validation_data, test_data):
@@ -301,7 +302,7 @@ class Solver(object):
         for _,_,p in ckpts:
             if p not in to_keep:
                 try:
-                    os.remove(p)
+                    send2trash(p)  # xóa vào thùng rác để có thể khôi phục nếu xóa nhầm
                     if self.print: print(f"Removed old checkpoint: {p}")
                 except FileNotFoundError:
                     pass
