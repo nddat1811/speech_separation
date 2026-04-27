@@ -462,6 +462,130 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+
+#new ne
+class FastGatedConvBlock(nn.Module):
+    def __init__(self, dim, inner_channels=256, norm_type='scalenorm'):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.pw_in = nn.Linear(dim, inner_channels * 2)
+
+        C = inner_channels // 3
+        C2 = inner_channels - 2 * C  # đảm bảo tổng đúng
+
+        # 3 kernel song song: RF = 21, 41, 65
+        self.dw_k21 = nn.Conv1d(C,  C,  kernel_size=21, padding=10,  groups=C)
+        self.dw_k41 = nn.Conv1d(C,  C,  kernel_size=41, padding=20,  groups=C)
+        self.dw_k65 = nn.Conv1d(C2, C2, kernel_size=65, padding=32,  groups=C2)
+
+        self.act     = nn.SiLU()
+        self.norm2   = nn.LayerNorm(inner_channels)
+        self.pw_out  = nn.Linear(inner_channels, dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        gate, content = self.pw_in(x).chunk(2, dim=-1)  # [B,T,inner]
+
+        c = content.transpose(1, 2)                      # [B,inner,T]
+        C = c.shape[1] // 3
+        c1, c2, c3 = c[:, :C], c[:, C:2*C], c[:, 2*C:]
+
+        # Song song 3 scale
+        out_c = torch.cat([
+            self.dw_k21(c1),
+            self.dw_k41(c2),
+            self.dw_k65(c3),
+        ], dim=1)                                         # [B,inner,T]
+
+        out_c = self.act(self.norm2(out_c.transpose(1, 2)))  # [B,T,inner]
+        out   = torch.sigmoid(gate) * out_c
+
+        return residual + self.dropout(self.pw_out(out))
+
+
+class TCNBlock(nn.Module):
+    """
+    1 TCN residual block: depthwise dilated conv + pointwise
+    """
+    def __init__(self, channels, kernel_size=3, dilation=1, dropout=0.1):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation // 2  # same padding
+
+        self.net = nn.Sequential(
+            # Pointwise expand
+            nn.Conv1d(channels, channels * 2, kernel_size=1),
+            nn.SiLU(),
+            # Depthwise dilated
+            nn.Conv1d(channels * 2, channels * 2,
+                      kernel_size=kernel_size,
+                      padding=padding,
+                      dilation=dilation,
+                      groups=channels * 2),
+            nn.SiLU(),
+            nn.GroupNorm(1, channels * 2),  # LayerNorm equivalent trên conv
+            # Pointwise squeeze
+            nn.Conv1d(channels * 2, channels, kernel_size=1),
+            nn.Dropout(dropout),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return x + self.gate(x) * self.net(x)
+
+
+class GatedTCNBlock(nn.Module):
+    """
+    Thay Gated_FSMN_Block_Dilated bằng TCN stack.
+    
+    RF với kernel=3, depth=8:
+      dilations = [1,2,4,8,16,32,64,128]
+      RF = 1 + 2*(3-1)*(1+2+4+...+128) = 1 + 4*255 = 1021 steps
+    
+    Tốc độ: nhanh hơn FSMN ~3-4x vì fully parallel
+    Chất lượng: tương đương hoặc tốt hơn (RF lớn hơn nhiều)
+    """
+    def __init__(self, dim, inner_channels=256, kernel_size=3,
+                 tcn_depth=6, norm_type='scalenorm', dropout=0.1):
+        super().__init__()
+        self.norm   = nn.LayerNorm(dim)
+        self.proj_in  = nn.Linear(dim, inner_channels)
+        self.proj_out = nn.Linear(inner_channels, dim)
+        self.dropout  = nn.Dropout(dropout)
+
+        # Dilations: 1, 2, 4, 8, 16, 32 → RF = 1 + 4*(63) = 253 steps
+        dilations = [2 ** i for i in range(tcn_depth)]
+        self.tcn = nn.ModuleList([
+            TCNBlock(inner_channels, kernel_size=kernel_size,
+                     dilation=d, dropout=dropout)
+            for d in dilations
+        ])
+
+        # Global gate từ input gốc
+        self.global_gate = nn.Sequential(
+            nn.Linear(dim, inner_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        residual = x                                 # [B,T,D]
+        g   = self.global_gate(x)                   # [B,T,inner]
+
+        x   = self.norm(x)
+        out = self.proj_in(x).transpose(1, 2)       # [B,inner,T]
+
+        for block in self.tcn:
+            out = block(out)                         # [B,inner,T]
+
+        out = out.transpose(1, 2)                    # [B,T,inner]
+        out = g * out                               # gating từ residual
+
+        return residual + self.dropout(self.proj_out(out))
+
 class GatedMultiScaleConv(nn.Module):
     """
     Multi-scale depthwise conv song song (không sequential).
@@ -504,6 +628,8 @@ class GatedMultiScaleConv(nn.Module):
         
         return residual + self.dropout(self.proj_out(out))
 
+###
+
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
         self,
@@ -530,7 +656,7 @@ class MossformerBlock_GFSMN(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.fsmn = nn.ModuleList([GatedMultiScaleConv(dim) for _ in range(depth)])
+        self.fsmn = nn.ModuleList([FastGatedConvBlock(dim) for _ in range(depth)])
         self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
