@@ -10,6 +10,8 @@ encoder_kernel_size: 16
 encoder_embedding_dim: 512
 mossformer_sequence_dim: 512
 num_mossformer_layer: 24
+sequence_backend: "ssm"   # "ssm" to replace Transformer-style attention block
+ssm_type: "mamba"         # "mamba" or "smamba"
 
 # Train
 load_type: 'one_input_multi_outputs'

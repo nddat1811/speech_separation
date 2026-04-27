@@ -110,6 +110,12 @@ if __name__ == '__main__':
                         help='the feature dimension used in MossFormer block')
     parser.add_argument('--num-mossformer_layer', dest='num_mossformer_layer', type=int, default='24',
                         help='the number of mosssformer layers used for sequence processing') 
+    parser.add_argument('--sequence_backend', type=str, default='ssm',
+                        choices=['hybrid', 'ssm'],
+                        help='hybrid: FLASH+SSM, ssm: replace Transformer-style block by SSM only')
+    parser.add_argument('--ssm_type', type=str, default='mamba',
+                        choices=['mamba', 'smamba'],
+                        help='SSM variant used when sequence backend includes SSM')
 
     # optimizer
     parser.add_argument('--effec_batch_size', type=int, help='effective Batch size')

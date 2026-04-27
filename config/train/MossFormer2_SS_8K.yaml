@@ -10,11 +10,13 @@ encoder_kernel_size: 16
 encoder_embedding_dim: 512
 mossformer_sequence_dim: 512
 num_mossformer_layer: 24
+sequence_backend: "ssm"   # "ssm" to replace Transformer-style attention block
+ssm_type: "mamba"         # "mamba" or "smamba"
 
 # Train
 load_type: 'one_input_multi_outputs'
-tr_list: 'C:\Users\tun\Desktop\code\speech_separation\data\train_MiniLibri_clean.scp'
-cv_list: 'C:\Users\tun\Desktop\code\speech_separation\data\val_MiniLibri_clean.scp'
+tr_list: 'data/train_MiniLibri_clean.scp'
+cv_list: 'data/val_MiniLibri_clean.scp'
 
 init_learning_rate: 0.00015 #learning rate for a new training
 finetune_learning_rate: 0.00005 #learning rate for a finetune training
@@ -32,5 +34,5 @@ seed: 1811
 num_workers: 4
 batch_size: 1
 accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
-effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
-max_length: 2         # truncate the utterances in dataloader, in seconds 
+effec_batch_size: 4   # lower gradient-accum target to reduce optimizer-step memory pressure
+max_length: 2         # truncate utterances to 1s first to avoid OOM; increase later if stable

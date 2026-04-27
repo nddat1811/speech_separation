@@ -18,3 +18,5 @@ encoder_kernel_size: 16
 encoder_embedding_dim: 512
 mossformer_sequence_dim: 512
 num_mossformer_layer: 24
+sequence_backend: "ssm"
+ssm_type: "mamba"
