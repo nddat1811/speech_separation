@@ -77,19 +77,14 @@ class OffsetScale(nn.Module):
         return out.unbind(dim = -2)
 
 class FFConvM(nn.Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_out,
-        norm_klass = nn.LayerNorm,
-        dropout = 0.1
-    ):
-        super().__init__()
+    def __init__(self, dim_in, dim_out, norm_klass=nn.LayerNorm, dropout=0.1):
+        super(FFConvM, self).__init__()
+        # Nếu dim_in != dim_out, giữ Linear để project dim
+        # Nếu dim_in == dim_out, ConvModule mới xử lý hết
         self.mdl = nn.Sequential(
             norm_klass(dim_in),
-            nn.Linear(dim_in, dim_out),
-            nn.SiLU(),
-            ConvModule(dim_out),
+            nn.Linear(dim_in, dim_out) if dim_in != dim_out else nn.Identity(),
+            ConvModule(dim_out, dropout_p=dropout),  # ConvModule mới full
             nn.Dropout(dropout)
         )
     def forward(

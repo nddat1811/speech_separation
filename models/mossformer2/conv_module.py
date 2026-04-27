@@ -269,30 +269,36 @@ class PointwiseConv1d(nn.Module):
 
 class ConvModule(nn.Module):
     """
-    Modified from Conformer convolution module to perform depth-wise convolution
-    Args:
-        in_channels (int): Number of channels in the input
-        kernel_size (int or tuple, optional): Size of the convolving kernel Default: 31
-        dropout_p (float, optional): probability of dropout
-    Inputs: inputs
-        inputs (batch, time, dim): Tensor contains input sequences
-    Outputs: outputs
-        outputs (batch, time, dim): Tensor produces by conformer convolution module.
+    Thay bằng Depthwise Separable Conv đầy đủ (Conformer-style)
     """
     def __init__(
-            self,
-            in_channels: int,
-            kernel_size: int = 17, 
-            expansion_factor: int = 2,
-            dropout_p: float = 0.1,
+        self,
+        in_channels: int,
+        kernel_size: int = 17,
+        expansion_factor: int = 2,
+        dropout_p: float = 0.1,
     ) -> None:
         super(ConvModule, self).__init__()
-        assert (kernel_size - 1) % 2 == 0, "kernel_size should be a odd number for 'SAME' padding"
-        assert expansion_factor == 2, "Currently, Only Supports expansion_factor 2"
+        assert (kernel_size - 1) % 2 == 0
 
         self.sequential = nn.Sequential(
             Transpose(shape=(1, 2)),
-            DepthwiseConv1d(in_channels, in_channels, kernel_size, stride=1, padding=(kernel_size - 1) // 2),
+            # 1. Pointwise expand (thay cho Linear trong FFConvM)
+            PointwiseConv1d(in_channels, in_channels * 2),
+            # 2. GLU gating
+            GLU(dim=1),
+            # 3. Depthwise conv (giữ nguyên)
+            DepthwiseConv1d(
+                in_channels, in_channels,
+                kernel_size, stride=1,
+                padding=(kernel_size - 1) // 2
+            ),
+            # 4. BatchNorm + activation
+            nn.BatchNorm1d(in_channels),
+            Swish(),
+            # 5. Pointwise project về lại dim gốc
+            PointwiseConv1d(in_channels, in_channels),
+            nn.Dropout(p=dropout_p),
         )
 
     def forward(self, inputs: Tensor) -> Tensor:
