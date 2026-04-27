@@ -15,6 +15,8 @@ from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
 # functions
+from mamba_ssm import Mamba
+
 
 def identity(t, *args, **kwargs):
     return t
@@ -457,6 +459,43 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+class MambaLayer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        bidirectional=True,   # True vì speech sep không cần causal
+    ):
+        super().__init__()
+        self.bidirectional = bidirectional
+        self.norm = nn.LayerNorm(dim)
+
+        if bidirectional:
+            # chia dim đôi cho 2 chiều
+            assert dim % 2 == 0
+            self.mamba_fwd = Mamba(d_model=dim // 2, d_state=d_state,
+                                   d_conv=d_conv, expand=expand)
+            self.mamba_bwd = Mamba(d_model=dim // 2, d_state=d_state,
+                                   d_conv=d_conv, expand=expand)
+        else:
+            self.mamba = Mamba(d_model=dim, d_state=d_state,
+                               d_conv=d_conv, expand=expand)
+
+    def forward(self, x, *, mask=None):  # thêm mask=None vào đây
+        h = self.norm(x)
+
+        if self.bidirectional:
+            h_f, h_b = h.chunk(2, dim=-1)
+            out_f = self.mamba_fwd(h_f)
+            out_b = self.mamba_bwd(h_b.flip(1)).flip(1)
+            out = torch.cat([out_f, out_b], dim=-1)
+        else:
+            out = self.mamba(h)
+
+        return x + out
+
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
         self,
@@ -484,7 +523,7 @@ class MossformerBlock_GFSMN(nn.Module):
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
         self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        self.layers = nn.ModuleList([MambaLayer(dim) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -532,7 +571,7 @@ class MossformerBlock(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+        self.layers = nn.ModuleList([MambaLayer(dim) for _ in range(depth)])
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
