@@ -635,7 +635,8 @@ class MossformerBlock_GFSMN(nn.Module):
         self.fsmn = nn.ModuleList([
             GatedTCNBlock(
                 dim=dim, inner_channels=dim,
-                kernel_size=3, tcn_depth=6,
+                kernel_size=3, 
+                tcn_depth=8, #run local là 6 --> 8.14, kaggle thử 8 xem ntn 
                 dropout=attn_dropout
             )
             for _ in range(depth)
