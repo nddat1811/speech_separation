@@ -14,6 +14,23 @@ from rotary_embedding_torch import RotaryEmbedding
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
+from mamba_ssm import Mamba
+
+class MambaLayer(nn.Module):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.mamba = Mamba(
+            d_model=dim,      # Model dimension
+            d_state=d_state,  # SSM state dimension
+            d_conv=d_conv,    # Local convolution width
+            expand=expand,    # Block expansion factor
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Pre-norm residual — đúng chuẩn, không double-norm
+        return x + self.mamba(self.norm(x)) 
+        
 # functions
 
 def identity(t, *args, **kwargs):
@@ -462,82 +479,112 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+class FastGatedConvBlock(nn.Module):
+    def __init__(self, dim, inner_channels=None, norm_type='scalenorm'):
+        super().__init__()
+        # Mặc định inner_channels = dim thay vì 256 cứng
+        inner_channels = inner_channels or dim
+        
+        self.norm    = nn.LayerNorm(dim)
+        self.pw_in   = nn.Linear(dim, inner_channels * 2)
+
+        # Tính C một lần tại __init__, dùng lại trong forward
+        self.C  = inner_channels // 3
+        self.C2 = inner_channels - 2 * self.C   # đảm bảo C + C + C2 == inner_channels
+
+        self.dw_k21  = nn.Conv1d(self.C,  self.C,  kernel_size=21, padding=10, groups=self.C)
+        self.dw_k41  = nn.Conv1d(self.C,  self.C,  kernel_size=41, padding=20, groups=self.C)
+        self.dw_k65  = nn.Conv1d(self.C2, self.C2, kernel_size=65, padding=32, groups=self.C2)
+
+        self.act     = nn.SiLU()
+        self.norm2   = nn.LayerNorm(inner_channels)
+        self.pw_out  = nn.Linear(inner_channels, dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        gate, content = self.pw_in(x).chunk(2, dim=-1)  # [B, T, inner]
+
+        c = content.transpose(1, 2)                      # [B, inner, T]
+        # Dùng self.C thay vì tính lại — nhất quán với lúc khởi tạo conv
+        c1 = c[:, :self.C]
+        c2 = c[:, self.C : 2 * self.C]
+        c3 = c[:, 2 * self.C:]
+
+        out_c = torch.cat([
+            self.dw_k21(c1),
+            self.dw_k41(c2),
+            self.dw_k65(c3),
+        ], dim=1)                                        # [B, inner, T]
+
+        out_c = self.act(self.norm2(out_c.transpose(1, 2)))  # [B, T, inner]
+        out   = torch.sigmoid(gate) * out_c
+        return residual + self.dropout(self.pw_out(out))
+
 class MossformerBlock_GFSMN(nn.Module):
+    """
+    Phiên bản lai (Hybrid): 
+    Mamba xử lý Global Context + Gated FSMN xử lý Local Refinement.
+    """
     def __init__(
         self,
         *,
         dim,
         depth,
-        group_size = 256, #384, #128, #256,
-        query_key_dim = 128, #256, #128,
-        expansion_factor = 4.,
-        causal = False,
-        attn_dropout = 0.1,
-        norm_type = 'scalenorm',
-        shift_tokens = True
+        d_state = 16,
+        expand = 2,
+        **kwargs # Để tương thích với các tham số cũ
     ):
         super().__init__()
-        assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
+        
+        # Mamba thay thế cho FLASH
+        self.mamba_layers = nn.ModuleList([
+            MambaLayer(dim=dim, d_state=d_state, expand=expand) 
+            for _ in range(depth)
+        ])
+        
+        # FSMN giữ nguyên để tinh chỉnh đặc trưng âm thanh cục bộ
+        self.fsmn_layers = nn.ModuleList([
+            FastGatedConvBlock(dim, inner_channels=dim)
+            for _ in range(depth)
+        ])
 
-        if norm_type == 'scalenorm':
-            norm_klass = ScaleNorm
-        elif norm_type == 'layernorm':
-            norm_klass = nn.LayerNorm
+    def forward(self, x, mask=None):
+        # Mamba không cần mask truyền thống như Transformer/FLASH
+        for mamba, fsmn in zip(self.mamba_layers, self.fsmn_layers):
+            x = mamba(x)
+            x = fsmn(x)
+        return x
 
-        self.group_size = group_size
-
-        rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
-        # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
-  
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
             UniDeepFsmn(in_channels, out_channels, lorder, hidden_size)
             for i in range(repeats)
         ]
         return nn.Sequential(*repeats)
-
-    def forward(
-        self,
-        x,
-        *,
-        mask = None
-    ):
-        ii = 0
-        for flash in self.layers:
-            x = flash(x, mask = mask)
-            x = self.fsmn[ii](x)
-            ii = ii + 1
-        return x
 
 class MossformerBlock(nn.Module):
+    """Phiên bản chỉ dùng Mamba thuần túy để tối ưu tốc độ tối đa."""
     def __init__(
         self,
         *,
         dim,
         depth,
-        group_size = 256, #384, #128, #256,
-        query_key_dim = 128, #256, #128,
-        expansion_factor = 4.,
-        causal = False,
-        attn_dropout = 0.1,
-        norm_type = 'scalenorm',
-        shift_tokens = True
+        d_state = 16,
+        expand = 2,
+        **kwargs
     ):
         super().__init__()
-        assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
+        self.layers = nn.ModuleList([
+            MambaLayer(dim=dim, d_state=d_state, expand=expand) 
+            for _ in range(depth)
+        ])
 
-        if norm_type == 'scalenorm':
-            norm_klass = ScaleNorm
-        elif norm_type == 'layernorm':
-            norm_klass = nn.LayerNorm
-
-        self.group_size = group_size
-
-        rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
-        # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
+    def forward(self, x, mask=None):
+        for mamba in self.layers:
+            x = mamba(x)
+        return x
 
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
         repeats = [
@@ -545,15 +592,3 @@ class MossformerBlock(nn.Module):
             for i in range(repeats)
         ]
         return nn.Sequential(*repeats)
-
-    def forward(
-        self,
-        x,
-        *,
-        mask = None
-    ):
-        ii = 0
-        for flash in self.layers:
-            x = flash(x, mask = mask)
-            ii = ii + 1
-        return x

@@ -7,9 +7,9 @@ network: "MossFormer2_SS_8K"  ##network type
 ## MossFormer2 parameters
 num_spks: 2 
 encoder_kernel_size: 16
-encoder_embedding_dim: 512
-mossformer_sequence_dim: 512
-num_mossformer_layer: 24
+encoder_embedding_dim: 768
+mossformer_sequence_dim: 768
+num_mossformer_layer: 48
 sequence_backend: "ssm"   # "ssm" to replace Transformer-style attention block
 ssm_type: "mamba"         # "mamba" or "smamba"
 
@@ -18,7 +18,7 @@ load_type: 'one_input_multi_outputs'
 tr_list: 'data/train_MiniLibri_clean.scp'
 cv_list: 'data/val_MiniLibri_clean.scp'
 
-init_learning_rate: 0.00015 #learning rate for a new training
+init_learning_rate: 0.0001 #learning rate for a new training
 finetune_learning_rate: 0.00005 #learning rate for a finetune training
 
 loss_threshold: -9999.0 #to prevent very low loss
@@ -26,13 +26,13 @@ max_epoch: 200 #default 120
 
 weight_decay: 0.00001
 clip_grad_norm: 10.
-optimizer_type: 'adam'  # 'adam' or 'adamw' (recommended: adamw)
+optimizer_type: 'adamw'  # 'adam' or 'adamw' (recommended: adamw)
 # Log 
 seed: 1811
 
 # # dataset
 num_workers: 4
 batch_size: 1
-accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
+accu_grad: 4  # accumulate multiple batch sizes for one back-propagation updating
 effec_batch_size: 4   # lower gradient-accum target to reduce optimizer-step memory pressure
 max_length: 2         # truncate utterances to 1s first to avoid OOM; increase later if stable
