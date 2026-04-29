@@ -14,6 +14,105 @@ from rotary_embedding_torch import RotaryEmbedding
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
 from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
+
+
+
+class ImprovedFastGatedConvBlock(nn.Module):
+    def __init__(
+        self,
+        dim,
+        inner_channels=None,
+        dropout=0.1,
+        kernels=(21, 41, 65),
+        gate_type="silu",   # "silu" hoặc "sigmoid"
+        use_channel_mix=True,
+        init_scale=0.1,
+    ):
+        super().__init__()
+
+        inner_channels = inner_channels or dim
+        assert len(kernels) == 3
+
+        self.norm = nn.LayerNorm(dim)
+        self.pw_in = nn.Linear(dim, inner_channels * 2)
+
+        self.C = inner_channels // 3
+        self.C2 = inner_channels - 2 * self.C
+
+        k1, k2, k3 = kernels
+
+        self.dw_k1 = nn.Conv1d(
+            self.C, self.C,
+            kernel_size=k1,
+            padding=k1 // 2,
+            groups=self.C
+        )
+
+        self.dw_k2 = nn.Conv1d(
+            self.C, self.C,
+            kernel_size=k2,
+            padding=k2 // 2,
+            groups=self.C
+        )
+
+        self.dw_k3 = nn.Conv1d(
+            self.C2, self.C2,
+            kernel_size=k3,
+            padding=k3 // 2,
+            groups=self.C2
+        )
+
+        self.norm2 = nn.LayerNorm(inner_channels)
+
+        # channel mixing nhẹ sau depthwise conv
+        if use_channel_mix:
+            self.channel_mix = nn.Sequential(
+                nn.Linear(inner_channels, inner_channels),
+                nn.SiLU()
+            )
+        else:
+            self.channel_mix = nn.Identity()
+
+        self.pw_out = nn.Linear(inner_channels, dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # residual scale giúp block không phá representation ban đầu
+        self.gamma = nn.Parameter(torch.ones(1) * init_scale)
+
+        self.gate_type = gate_type
+
+    def forward(self, x):
+        residual = x
+
+        x = self.norm(x)
+        gate, content = self.pw_in(x).chunk(2, dim=-1)
+
+        c = content.transpose(1, 2)
+
+        c1 = c[:, :self.C]
+        c2 = c[:, self.C: 2 * self.C]
+        c3 = c[:, 2 * self.C:]
+
+        out_c = torch.cat([
+            self.dw_k1(c1),
+            self.dw_k2(c2),
+            self.dw_k3(c3),
+        ], dim=1)
+
+        out_c = out_c.transpose(1, 2)
+        out_c = self.norm2(out_c)
+        out_c = self.channel_mix(out_c)
+
+        if self.gate_type == "sigmoid":
+            out = torch.sigmoid(gate) * out_c
+        elif self.gate_type == "silu":
+            out = F.silu(gate) * out_c
+        else:
+            raise ValueError(f"Unknown gate_type: {self.gate_type}")
+
+        out = self.pw_out(out)
+
+        return residual + self.gamma * self.dropout(out)
 # functions
 
 def identity(t, *args, **kwargs):
@@ -462,6 +561,64 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+class AdvancedGatedConvBlock(nn.Module):
+    def __init__(self, dim, expansion_factor=2, dropout=0.1):
+        super().__init__()
+        inner_dim = int(dim * expansion_factor)
+        
+        self.norm = nn.LayerNorm(dim)
+        
+        # Nhánh Gate và Nhánh Content
+        self.pw_in = nn.Linear(dim, inner_dim * 2)
+        
+        # Thay vì chia nhỏ channel, ta dùng các mức Dilation khác nhau
+        # để học được cả chi tiết (local) và ngữ cảnh (global)
+        self.dw_conv1 = nn.Conv1d(inner_dim, inner_dim, kernel_size=7, padding=3, groups=inner_dim)
+        self.dw_conv2 = nn.Conv1d(inner_dim, inner_dim, kernel_size=7, padding=9, dilation=3, groups=inner_dim)
+        self.dw_conv3 = nn.Conv1d(inner_dim, inner_dim, kernel_size=7, padding=15, dilation=5, groups=inner_dim)
+        
+        # Trộn các thang đo lại với nhau
+        self.fuse_conv = nn.Conv1d(inner_dim, inner_dim, kernel_size=1)
+        
+        self.act = nn.SiLU()
+        self.pw_out = nn.Linear(inner_dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        
+        # Trọng lượng học được để cân bằng các nhánh conv
+        self.alphas = nn.Parameter(torch.ones(3))
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        
+        # 1. Linear Projection
+        gate, content = self.pw_in(x).chunk(2, dim=-1)
+        
+        # 2. Multi-scale Dilated Convolution (bắt chước bộ nhớ FSMN)
+        # Chuyển sang [B, C, T] cho Conv1d
+        c = content.transpose(1, 2)
+        
+        # Tính toán song song các thang đo
+        # Alphas giúp mô hình tự học xem nên ưu tiên nhìn xa hay nhìn gần
+        c1 = self.dw_conv1(c)
+        c2 = self.dw_conv2(c)
+        c3 = self.dw_conv3(c)
+        
+        # Kết hợp các luồng thông tin
+        fused_c = self.alphas[0] * c1 + self.alphas[1] * c2 + self.alphas[2] * c3
+        fused_c = self.fuse_conv(fused_c)
+        
+        # Chuyển lại [B, T, C]
+        fused_c = fused_c.transpose(1, 2)
+        
+        # 3. Gating Mechanism nâng cao
+        # Dùng SiLU cho content và Sigmoid cho gate
+        out = self.act(fused_c) * torch.sigmoid(gate)
+        
+        # 4. Output projection & Residual
+        out = self.pw_out(out)
+        return residual + self.dropout(out)
+
 class MossformerBlock_GFSMN(nn.Module):
     def __init__(
         self,
@@ -488,7 +645,18 @@ class MossformerBlock_GFSMN(nn.Module):
 
         rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
         # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
+        self.fsmn = nn.ModuleList([AdvancedGatedConvBlock(dim) for _ in range(depth)])
+        # self.fsmn = nn.ModuleList([
+        #     ImprovedFastGatedConvBlock(
+        #         dim,
+        #         inner_channels=dim,
+        #         kernels=(21, 41, 65),
+        #         gate_type="silu",
+        #         use_channel_mix=True,
+        #         init_scale=0.1,
+        #     )
+        #     for _ in range(depth)
+        # ])
         self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
   
     def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
