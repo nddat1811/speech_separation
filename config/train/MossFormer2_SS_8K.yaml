@@ -26,13 +26,13 @@ max_epoch: 200 #default 120
 
 weight_decay: 0.00001
 clip_grad_norm: 10.
-optimizer_type: 'adam'  # 'adam' or 'adamw' (recommended: adamw)
+optimizer_type: 'adamw'  # 'adam' or 'adamw' (recommended: adamw)
 # Log 
 seed: 1811
 
 # # dataset
 num_workers: 4
 batch_size: 1
-accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
+accu_grad: 4  # accumulate multiple batch sizes for one back-propagation updating
 effec_batch_size: 4   # lower gradient-accum target to reduce optimizer-step memory pressure
 max_length: 2         # truncate utterances to 1s first to avoid OOM; increase later if stable

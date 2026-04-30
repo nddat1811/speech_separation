@@ -462,55 +462,231 @@ class Gated_FSMN_Block_Dilated(nn.Module):
         conv2 = self.conv2(norm2)
         return conv2.transpose(2,1) + input
 
+# nay run version 1 ne
+class HyenaFilterOri(nn.Module):
+    def __init__(self, dim, order=2, filter_dim=64):
+        super().__init__()
+        self.order = order
+        self.dim = dim
+        
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(1, filter_dim),
+            nn.SiLU(),
+            nn.Linear(filter_dim, filter_dim),
+            nn.SiLU(),
+            nn.Linear(filter_dim, dim * order)
+        )
+        self.proj = nn.Linear(dim, dim * (order + 1))
+        self.out  = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        residual = x
+        x = self.norm(x)
+        
+        t = torch.linspace(0, 1, T, device=x.device).unsqueeze(-1)
+        h = self.pos_mlp(t)                                          # [T, C*order]
+        h = h.view(T, self.order, C)
+        
+        zs = self.proj(x).chunk(self.order + 1, dim=-1)             # tuple of [B, T, C]
+        
+        z = zs[0]
+        for i in range(self.order):
+            z_f = torch.fft.rfft(z, n=2*T, dim=1)                   # [B, T//2+1, C] (complex)
+            h_f = torch.fft.rfft(
+                h[:, i, :].unsqueeze(0).expand(B, -1, -1),          # [B, T, C]
+                n=2*T, dim=1
+            )
+            z = torch.fft.irfft(z_f * h_f, n=2*T, dim=1)[:, :T]    # [B, T, C]
+            z = z * zs[i + 1]
+        
+        return residual + self.out(z)
+
+class HyenaFilter(nn.Module):
+    def __init__(self, dim, order=2, filter_dim=64):
+        super().__init__()
+        self.order = order
+        self.dim   = dim
+
+        # ── Projection: Linear + DepthwiseConv1d (đúng paper) ──
+        self.proj_linear = nn.Linear(dim, dim * (order + 1))
+        self.proj_dw     = nn.Conv1d(
+            dim * (order + 1),
+            dim * (order + 1),
+            kernel_size=3, padding=1,
+            groups=dim * (order + 1)   # depthwise
+        )
+
+        # ── HyenaFilter: FFN + Window (đúng paper) ─────────────
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(1, filter_dim),
+            nn.SiLU(),
+            nn.Linear(filter_dim, filter_dim),
+            nn.SiLU(),
+            nn.Linear(filter_dim, dim * order)
+        )
+        # Window decay học được — paper dùng exponential
+        self.window_log_decay = nn.Parameter(torch.zeros(dim * order))
+
+        self.out  = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+        # ── Local branch (giữ nguyên) ───────────────────────────
+        self.C1 = dim // 3
+        self.C2 = dim // 3
+        self.C3 = dim - 2 * (dim // 3)
+
+        self.local_dw_s = nn.Conv1d(self.C1, self.C1, kernel_size=3,  padding=1,  groups=self.C1)
+        self.local_dw_m = nn.Conv1d(self.C2, self.C2, kernel_size=15, padding=7,  groups=self.C2)
+        self.local_dw_l = nn.Conv1d(self.C3, self.C3, kernel_size=31, padding=15, groups=self.C3)
+
+        self.local_norm = nn.LayerNorm(dim)
+        self.local_pw   = nn.Linear(dim, dim)
+        self.local_gate = nn.Linear(dim, dim)
+        self.alpha      = nn.Parameter(torch.tensor(0.5))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        residual = x
+        x = self.norm(x)
+
+        # ── Projection (Algorithm 1) ────────────────────────────
+        z = self.proj_linear(x)                          # [B, T, C*(order+1)]
+        # DepthwiseConv1d trên chiều thời gian
+        z = self.proj_dw(z.transpose(1, 2)).transpose(1, 2)
+        zs = z.chunk(self.order + 1, dim=-1)             # tuple of [B, T, C]
+
+        # ── HyenaFilter (Algorithm 2) ───────────────────────────
+        t   = torch.linspace(0, 1, T, device=x.device).unsqueeze(-1)   # [T, 1]
+        h   = self.pos_mlp(t)                                           # [T, C*order]
+
+        # Window decay: h = ĥ · exp(-decay * t)
+        decay  = F.softplus(self.window_log_decay)                      # đảm bảo > 0
+        window = torch.exp(
+            -decay.unsqueeze(0) * torch.linspace(0, 1, T, device=x.device).unsqueeze(-1)
+        )                                                                # [T, C*order]
+        h = h * window                                                   # [T, C*order]
+        h = h.view(T, self.order, C)                                    # [T, order, C]
+
+        # ── Forward pass (Algorithm 3) ──────────────────────────
+        z = zs[0]
+        for i in range(self.order):
+            z_f = torch.fft.rfft(z, n=2*T, dim=1)
+            h_f = torch.fft.rfft(
+                h[:, i, :].unsqueeze(0).expand(B, -1, -1),
+                n=2*T, dim=1
+            )
+            z = torch.fft.irfft(z_f * h_f, n=2*T, dim=1)[:, :T]
+            z = z * zs[i + 1]
+        global_out = self.out(z)
+
+        # ── Local branch (giữ nguyên) ───────────────────────────
+        x_t = x.transpose(1, 2)
+        local = torch.cat([
+            self.local_dw_s(x_t[:, :self.C1, :]),
+            self.local_dw_m(x_t[:, self.C1:self.C1+self.C2, :]),
+            self.local_dw_l(x_t[:, self.C1+self.C2:, :]),
+        ], dim=1).transpose(1, 2)
+
+        local = self.local_norm(local)
+        local = self.local_pw(local) * torch.sigmoid(self.local_gate(x))
+
+        alpha = torch.sigmoid(self.alpha)
+        return residual + alpha * global_out + (1 - alpha) * local
+class HyenaBlock(nn.Module):
+    def __init__(self,
+                 dim,
+                 inner_channels=256,
+                 group_size=256,
+                 norm_type='scalenorm',
+                 order=2,
+                 filter_dim=64):
+        super().__init__()
+
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(dim, inner_channels, kernel_size=1),
+            nn.PReLU(),
+        )
+        # Bỏ norm1 — HyenaFilter đã tự norm bên trong
+        self.hyena = HyenaFilter(
+            dim=inner_channels,
+            order=order,
+            filter_dim=filter_dim,
+        )
+        self.norm2 = CLayerNorm(inner_channels)
+        self.conv2 = nn.Conv1d(inner_channels, dim, kernel_size=1)
+
+    def forward(self, input):
+        conv1 = self.conv1(input.transpose(2, 1))   # [B, inner, T]
+        seq_out = self.hyena(conv1.transpose(2, 1)) # [B, T, inner]
+        norm2 = self.norm2(seq_out.transpose(2, 1)) # [B, inner, T]
+        conv2 = self.conv2(norm2)                   # [B, dim, T]
+        return conv2.transpose(2, 1) + input
+
 class MossformerBlock_GFSMN(nn.Module):
+    """
+    Hybrid: FLASH (global) + Hyena (local sequential).
+    Chỉ thay dòng Gated_FSMN_Block_Dilated → HyenaBlock.
+    """
     def __init__(
         self,
         *,
         dim,
         depth,
-        group_size = 256, #384, #128, #256,
-        query_key_dim = 128, #256, #128,
-        expansion_factor = 4.,
-        causal = False,
-        attn_dropout = 0.1,
-        norm_type = 'scalenorm',
-        shift_tokens = True
+        group_size=256,
+        query_key_dim=128,
+        expansion_factor=1.,
+        causal=False,
+        attn_dropout=0.1,
+        norm_type='scalenorm',
+        shift_tokens=True,
+        # Hyena params mới
+        hyena_order=2,
+        hyena_filter_dim=64,
+        inner_channels=256,
     ):
         super().__init__()
-        assert norm_type in ('scalenorm', 'layernorm'), 'norm_type must be one of scalenorm or layernorm'
 
         if norm_type == 'scalenorm':
             norm_klass = ScaleNorm
         elif norm_type == 'layernorm':
             norm_klass = nn.LayerNorm
 
-        self.group_size = group_size
+        rotary_pos_emb = RotaryEmbedding(dim=min(32, query_key_dim))
 
-        rotary_pos_emb = RotaryEmbedding(dim = min(32, query_key_dim))
-        # max rotary embedding dimensions of 32, partial Rotary embeddings, from Wang et al - GPT-J
-        self.fsmn = nn.ModuleList([Gated_FSMN_Block_Dilated(dim) for _ in range(depth)])
-        self.layers = nn.ModuleList([FLASH_ShareA_FFConvM(dim = dim, group_size = group_size, query_key_dim = query_key_dim, expansion_factor = expansion_factor, causal = causal, dropout = attn_dropout, rotary_pos_emb = rotary_pos_emb, norm_klass = norm_klass, shift_tokens = shift_tokens) for _ in range(depth)])
-  
-    def _build_repeats(self, in_channels, out_channels, lorder, hidden_size, repeats=1):
-        repeats = [
-            UniDeepFsmn(in_channels, out_channels, lorder, hidden_size)
-            for i in range(repeats)
-        ]
-        return nn.Sequential(*repeats)
+        # FLASH layers — giữ nguyên hoàn toàn
+        self.flash_layers = nn.ModuleList([
+            FLASH_ShareA_FFConvM(
+                dim=dim,
+                group_size=group_size,
+                query_key_dim=query_key_dim,
+                expansion_factor=expansion_factor,
+                causal=causal,
+                dropout=attn_dropout,
+                rotary_pos_emb=rotary_pos_emb,
+                norm_klass=norm_klass,
+                shift_tokens=shift_tokens,
+            )
+            for _ in range(depth)
+        ])
 
-    def forward(
-        self,
-        x,
-        *,
-        mask = None
-    ):
-        ii = 0
-        for flash in self.layers:
-            x = flash(x, mask = mask)
-            x = self.fsmn[ii](x)
-            ii = ii + 1
-        return x
+        # Hyena thay cho FSMN dilated
+        self.hyena_layers = nn.ModuleList([
+            HyenaBlock(
+                dim=dim,
+                inner_channels=inner_channels,
+                order=hyena_order,
+                filter_dim=hyena_filter_dim,
+            )
+            for _ in range(depth)
+        ])
 
+    def forward(self, x, mask=None):
+        for flash, hyena in zip(self.flash_layers, self.hyena_layers):
+            x = flash(x, mask=mask)
+            x = hyena(x)
+        return x        
 class MossformerBlock(nn.Module):
     def __init__(
         self,
