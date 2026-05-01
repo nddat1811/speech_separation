@@ -33,7 +33,7 @@ seed: 1811
 # # dataset
 num_workers: 2
 batch_size: 1
-accu_grad: 1  # accumulate multiple batch sizes for one back-propagation updating
+accu_grad: 4  # accumulate multiple batch sizes for one back-propagation updating
 effec_batch_size: 4   # per GPU, only used if accu_grad is set to 1, must be multiple times of batch size
 max_length: 2         # truncate the utterances in dataloader, in seconds 
 
