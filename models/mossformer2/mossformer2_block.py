@@ -12,7 +12,7 @@ from einops import rearrange
 from rotary_embedding_torch import RotaryEmbedding
 
 from models.mossformer2.conv_module import ConvModule, GLU, FFConvM_Dilated
-from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated
+from models.mossformer2.fsmn import UniDeepFsmn, UniDeepFsmn_dilated, UniDeepFsmn_dilated_light
 from models.mossformer2.layer_norm import CLayerNorm, GLayerNorm, GlobLayerNorm, ILayerNorm
 # functions
 
@@ -379,7 +379,7 @@ class Gated_FSMN_dilated(nn.Module):
             norm_klass = nn.LayerNorm,
             dropout = 0.1,
             )
-        self.fsmn = UniDeepFsmn_dilated(in_channels, out_channels, lorder, hidden_size)
+        self.fsmn = UniDeepFsmn_dilated_light(in_channels, out_channels, lorder, hidden_size)
 
     def forward(
         self,
